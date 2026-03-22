@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Local tooling
+.claude/
+tmp/
+
+# Inputs and generated outputs
+input/raw_pdf/
+output/
+
+# Environment files
+.env
+.env.*

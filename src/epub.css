@@ -1,0 +1,19 @@
+body {
+  font-family: "PingFang SC", "Hiragino Sans GB", "Noto Serif CJK SC", serif;
+  line-height: 1.7;
+  margin: 0;
+  padding: 0;
+  widows: 2;
+  orphans: 2;
+}
+
+h1 {
+  font-size: 1.5em;
+  margin: 1.2em 0 1em;
+  text-align: center;
+}
+
+p {
+  margin: 0 0 0.9em;
+  text-indent: 2em;
+}

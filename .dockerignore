@@ -1,0 +1,8 @@
+input/raw_pdf/
+output/
+tmp/
+__pycache__/
+*.pyc
+*.pyo
+*.pdf
+*.epub
