@@ -2,10 +2,9 @@
 """PDF to EPUB converter with Claude CLI-based text cleaning.
 
 Usage:
-    docker build -f src/Dockerfile -t pdf2epub .
-    docker run --rm -v "$PWD":/workspace pdf2epub --check-tools
-    docker run --rm -v "$PWD":/workspace pdf2epub --input input/raw_pdf/xxx.pdf
-    docker run --rm -v "$PWD":/workspace pdf2epub --all
+    conda run -n pdf2epub python src/pdf2epub.py --check-tools
+    conda run -n pdf2epub python src/pdf2epub.py --input input/xxx.pdf
+    conda run -n pdf2epub python src/pdf2epub.py --all
 """
 from __future__ import annotations
 
@@ -21,11 +20,13 @@ from pathlib import Path
 
 # Paths
 ROOT = Path(__file__).resolve().parent.parent
-INPUT_DIR = ROOT / "input" / "raw_pdf"
+INPUT_DIR = ROOT / "input"
+ARCHIVED_INPUT_DIR = ROOT / "archived" / "pdf"
 OCR_DIR = ROOT / "output" / "ocr_pdf"
 SIDECAR_DIR = ROOT / "output" / "sidecar_txt"
 MD_DIR = ROOT / "output" / "clean_md"
-OUTPUT_DIR = ROOT / "output" / "epub"
+OUTPUT_DIR = ROOT / "epub"
+ARCHIVED_EPUB_DIR = ROOT / "archived" / "epub"
 LOG_DIR = ROOT / "output" / "logs" / "run"
 CSS_PATH = ROOT / "src" / "epub.css"
 PROMPT_PATH = ROOT / "src" / "clean_prompt.md"
@@ -81,7 +82,17 @@ class BookResult:
 
 
 def ensure_directories() -> None:
-    for path in (INPUT_DIR, OCR_DIR, SIDECAR_DIR, MD_DIR, OUTPUT_DIR, LOG_DIR, CSS_PATH.parent):
+    for path in (
+        INPUT_DIR,
+        ARCHIVED_INPUT_DIR,
+        OCR_DIR,
+        SIDECAR_DIR,
+        MD_DIR,
+        OUTPUT_DIR,
+        ARCHIVED_EPUB_DIR,
+        LOG_DIR,
+        CSS_PATH.parent,
+    ):
         path.mkdir(parents=True, exist_ok=True)
 
     legacy_chunk_dirs = [
@@ -377,6 +388,36 @@ def cleanup_success_outputs(ocr_pdf: Path, markdown_path: Path) -> None:
             path.unlink()
 
 
+def build_archive_path(source: Path, archive_dir: Path) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    candidate = archive_dir / f"{source.stem}--{timestamp}{source.suffix}"
+    counter = 1
+    while candidate.exists():
+        candidate = archive_dir / f"{source.stem}--{timestamp}-{counter}{source.suffix}"
+        counter += 1
+    return candidate
+
+
+def archive_file(source: Path, archive_dir: Path) -> Path | None:
+    if not source.exists():
+        return None
+    archive_path = build_archive_path(source, archive_dir)
+    shutil.move(str(source), str(archive_path))
+    return archive_path
+
+
+def archive_existing_epub(epub_path: Path) -> Path | None:
+    return archive_file(epub_path, ARCHIVED_EPUB_DIR)
+
+
+def archive_input_pdf(input_pdf: Path) -> Path | None:
+    try:
+        input_pdf.resolve().relative_to(INPUT_DIR.resolve())
+    except ValueError:
+        return None
+    return archive_file(input_pdf, ARCHIVED_INPUT_DIR)
+
+
 def process_book(input_pdf: Path, language: str, skip_ocr: bool) -> BookResult:
     started_at = datetime.now().isoformat(timespec="seconds")
     base_name = input_pdf.stem
@@ -406,11 +447,18 @@ def process_book(input_pdf: Path, language: str, skip_ocr: bool) -> BookResult:
         result.finished_at = datetime.now().isoformat(timespec="seconds")
         return result
 
+    archived_epub = archive_existing_epub(epub_path)
+    if archived_epub:
+        result.stages["archive_epub"] = StageResult(status="ok", output=str(archived_epub))
+
     epub_result = stage_epub(markdown_path, epub_path, base_name)
     result.stages["epub"] = epub_result
     result.status = "ok" if epub_result.status == "ok" else "failed"
     if result.status == "ok":
         cleanup_success_outputs(ocr_pdf, markdown_path)
+        archived_input = archive_input_pdf(input_pdf)
+        if archived_input:
+            result.stages["archive_input"] = StageResult(status="ok", output=str(archived_input))
     result.finished_at = datetime.now().isoformat(timespec="seconds")
     return result
 
@@ -446,14 +494,14 @@ def parse_args() -> argparse.Namespace:
         description="OCR scanned PDFs and convert to EPUB with Claude CLI cleaning.",
         epilog=(
             "Usage:\n"
-            "  docker build -f src/Dockerfile -t pdf2epub .\n"
-            "  docker run --rm -v \"$PWD\":/workspace pdf2epub --check-tools\n"
-            "  docker run --rm -v \"$PWD\":/workspace pdf2epub --all\n"
+            "  conda run -n pdf2epub python src/pdf2epub.py --check-tools\n"
+            "  conda run -n pdf2epub python src/pdf2epub.py --all\n"
+            "  conda run -n pdf2epub python src/pdf2epub.py --skip-ocr --all\n"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("--input", help="Process a single PDF file.")
-    parser.add_argument("--all", action="store_true", help="Process all PDFs in input/raw_pdf/.")
+    parser.add_argument("--all", action="store_true", help="Process all PDFs in input/.")
     parser.add_argument("--skip-ocr", action="store_true", help="Reuse existing sidecar text.")
     parser.add_argument("--lang", default=DEFAULT_LANG, help=f"OCR language. Default: {DEFAULT_LANG}")
     parser.add_argument("--check-tools", action="store_true", help="Check tool availability.")

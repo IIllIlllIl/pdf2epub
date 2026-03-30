@@ -11,7 +11,9 @@ __pycache__/
 tmp/
 
 # Inputs and generated outputs
-input/raw_pdf/
+input/
+epub/
+archived/
 output/
 
 # Environment files

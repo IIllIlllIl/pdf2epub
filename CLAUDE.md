@@ -13,15 +13,22 @@
 - 主脚本 `src/pdf2epub.py`，保持精简
 - 清洗逻辑通过 `src/clean_prompt.md` 控制
 - Python 仅用标准库（调用 claude）
-- 不要把原始 PDF 移出 `input/raw_pdf/`
+- 最新待处理 PDF 放在 `input/`
+- 处理成功后的输入 PDF 归档到 `archived/pdf/`
+- 最新生成的 EPUB 放在 `epub/`
+- 被替换的旧 EPUB 归档到 `archived/epub/`
 
 ## 常用命令
 
 ```bash
-docker build -f src/Dockerfile -t pdf2epub .
-docker run --rm -v "$PWD":/workspace pdf2epub --check-tools
-docker run --rm -v "$PWD":/workspace pdf2epub --all
-docker run --rm -v "$PWD":/workspace pdf2epub --all --skip-ocr
+conda run -n pdf2epub python src/pdf2epub.py --check-tools
+conda run -n pdf2epub python src/pdf2epub.py --all
+conda run -n pdf2epub python src/pdf2epub.py --all --skip-ocr
+
+# 可选：Docker
+# docker build -f src/Dockerfile -t pdf2epub .
+# docker run --rm -v "$PWD":/workspace pdf2epub --check-tools
+# docker run --rm -v "$PWD":/workspace pdf2epub --all
 ```
 
 ## 开发重点
@@ -33,5 +40,5 @@ docker run --rm -v "$PWD":/workspace pdf2epub --all --skip-ocr
 ## 验收标准
 
 - `output/sidecar_txt/*.txt` 可复用
-- `.epub` 可打开
+- `epub/*.epub` 可打开
 - 日志完整（含 input_tokens、output_tokens）

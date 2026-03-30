@@ -1,4 +1,6 @@
-input/raw_pdf/
+input/
+archived/
+epub/
 output/
 tmp/
 __pycache__/
