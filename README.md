@@ -7,7 +7,7 @@
 - **OCR**: `ocrmypdf + tesseract`
 - **文本清洗**: `claude` 命令（LLM 智能清洗）
 - **EPUB 生成**: `pandoc`
-- **运行环境**: Docker 容器化
+- **运行环境**: Docker 容器化 / 本地 conda 环境
 
 ## 目录结构
 
@@ -32,19 +32,25 @@ pdf2epub/
 
 ## 快速开始
 
-### 1. 启动 Docker 后端
+### 1. 准备运行环境
+
+可任选其一：
+
+#### Docker
 
 ```bash
 colima start  # macOS
-```
-
-### 2. 构建镜像
-
-```bash
 docker build -f src/Dockerfile -t pdf2epub .
 ```
 
-### 3. 准备 Claude CLI 认证
+#### 本地 conda
+
+```bash
+conda create -y -n pdf2epub python=3.11 pandoc tesseract ocrmypdf -c conda-forge
+conda run -n pdf2epub pip install "ocrmypdf>=16,<17"
+```
+
+### 2. 准备 Claude CLI 认证
 
 请通过环境变量向容器提供 Claude 认证。常见做法：
 - 设置 `ANTHROPIC_AUTH_TOKEN`；或
@@ -52,25 +58,35 @@ docker build -f src/Dockerfile -t pdf2epub .
 
 `run.sh` 会传递常见认证环境变量，但不会挂载宿主机 `$HOME/.claude`，以保持容器内 Claude 运行环境独立。
 
-### 4. 检查工具
+### 3. 检查工具
 
 ```bash
+# Docker
 docker run --rm -v "$PWD":/workspace pdf2epub --check-tools
+
+# conda
+conda run -n pdf2epub python src/pdf2epub.py --check-tools
 ```
 
 预期输出应包含：`claude`、`ocrmypdf`、`tesseract`、`pandoc`。
 
-### 5. 处理 PDF
+### 4. 处理 PDF
 
 ```bash
-# 单个 PDF
+# Docker：单个 PDF
 ./run.sh --input input/raw_pdf/三联生活周刊2026年第10期.pdf
 
-# 批量处理
+# Docker：批量处理
 ./run.sh --all
 
-# 复用已有 sidecar，仅重跑清洗与 EPUB
+# Docker：复用已有 sidecar，仅重跑清洗与 EPUB
 ./run.sh --all --skip-ocr
+
+# conda：批量处理
+conda run -n pdf2epub python src/pdf2epub.py --all
+
+# conda：复用已有 sidecar，仅重跑清洗与 EPUB
+conda run -n pdf2epub python src/pdf2epub.py --all --skip-ocr
 ```
 
 如果不使用 `run.sh`，请自行传递认证环境变量。
