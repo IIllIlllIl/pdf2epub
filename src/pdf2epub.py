@@ -21,12 +21,12 @@ from pathlib import Path
 # Paths
 ROOT = Path(__file__).resolve().parent.parent
 INPUT_DIR = ROOT / "input"
-ARCHIVED_INPUT_DIR = ROOT / "archived" / "pdf"
+ARCHIVED_INPUT_DIR = ROOT / "input" / "archived_pdf"
 OCR_DIR = ROOT / "output" / "ocr_pdf"
 SIDECAR_DIR = ROOT / "output" / "sidecar_txt"
 MD_DIR = ROOT / "output" / "clean_md"
-OUTPUT_DIR = ROOT / "epub"
-ARCHIVED_EPUB_DIR = ROOT / "archived" / "epub"
+OUTPUT_DIR = ROOT / "output" / "epub"
+ARCHIVED_EPUB_DIR = ROOT / "output" / "archived_epub"
 LOG_DIR = ROOT / "output" / "logs" / "run"
 CSS_PATH = ROOT / "src" / "epub.css"
 PROMPT_PATH = ROOT / "src" / "clean_prompt.md"
@@ -418,6 +418,18 @@ def archive_input_pdf(input_pdf: Path) -> Path | None:
     return archive_file(input_pdf, ARCHIVED_INPUT_DIR)
 
 
+def archive_stale_epubs(current_batch_outputs: set[Path]) -> list[str]:
+    archived: list[str] = []
+    current_batch_resolved = {path.resolve() for path in current_batch_outputs}
+    for epub_path in sorted(OUTPUT_DIR.glob("*.epub")):
+        if epub_path.resolve() in current_batch_resolved:
+            continue
+        archived_path = archive_file(epub_path, ARCHIVED_EPUB_DIR)
+        if archived_path:
+            archived.append(str(archived_path))
+    return archived
+
+
 def process_book(input_pdf: Path, language: str, skip_ocr: bool) -> BookResult:
     started_at = datetime.now().isoformat(timespec="seconds")
     base_name = input_pdf.stem
@@ -446,10 +458,6 @@ def process_book(input_pdf: Path, language: str, skip_ocr: bool) -> BookResult:
         result.status = "failed"
         result.finished_at = datetime.now().isoformat(timespec="seconds")
         return result
-
-    archived_epub = archive_existing_epub(epub_path)
-    if archived_epub:
-        result.stages["archive_epub"] = StageResult(status="ok", output=str(archived_epub))
 
     epub_result = stage_epub(markdown_path, epub_path, base_name)
     result.stages["epub"] = epub_result
@@ -533,21 +541,31 @@ def main() -> int:
         "language": args.lang,
         "skip_ocr": args.skip_ocr,
         "inputs": [str(p) for p in inputs],
+        "retention_mode": "batch_latest",
         "books": [],
     }
 
     had_failure = False
+    successful_epubs: set[Path] = set()
     for input_pdf in inputs:
         book_result = process_book(input_pdf, args.lang, args.skip_ocr)
         summary["books"].append(book_result.to_dict())
         if book_result.status != "ok":
             had_failure = True
+        else:
+            epub_stage = (book_result.stages or {}).get("epub")
+            if epub_stage and epub_stage.output:
+                successful_epubs.add(Path(epub_stage.output))
 
         status = book_result.status.upper()
         print(f"[{status}] {input_pdf.name}")
         for stage_name, stage in (book_result.stages or {}).items():
             detail = stage.output or stage.error or ""
             print(f"  - {stage_name}: {stage.status} {detail}".rstrip())
+
+    archived_epubs = archive_stale_epubs(successful_epubs)
+    summary["batch_epub_outputs"] = [str(path) for path in sorted(successful_epubs)]
+    summary["archived_epubs"] = archived_epubs
 
     summary["finished_at"] = datetime.now().isoformat(timespec="seconds")
     summary_path = LOG_DIR / f"{run_id}.json"

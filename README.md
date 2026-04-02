@@ -14,11 +14,10 @@
 ```text
 pdf2epub/
   input/               # 最新待处理 PDF
-  archived/
-    pdf/               # 已处理完成的输入 PDF
-    epub/              # 被替换的旧 EPUB
-  epub/                # 最新生成的 EPUB
+    archived_pdf/      # 已处理完成的输入 PDF
   output/
+    epub/              # 最新生成的 EPUB
+    archived_epub/     # 被替换的旧 EPUB
     ocr_pdf/           # OCR 后 PDF（成功后自动清理）
     sidecar_txt/       # OCR 原始文本（可供 --skip-ocr 复用）
     clean_md/          # 清洗后 Markdown（成功后自动清理）
@@ -95,7 +94,7 @@ conda run -n pdf2epub python src/pdf2epub.py --all --skip-ocr
 | 参数 | 说明 |
 |------|------|
 | `--input <pdf>` | 处理单个 PDF |
-| `--all` | 处理 `input/` 下全部 PDF |
+| `--all` | 处理 `input/` 下全部 PDF（运行后 `output/epub/` 仅保留本批次成功结果） |
 | `--skip-ocr` | 复用已有 sidecar 文本 |
 | `--lang <lang>` | OCR 语言，默认 `chi_sim+eng` |
 | `--check-tools` | 检查工具可用性 |
@@ -104,11 +103,17 @@ conda run -n pdf2epub python src/pdf2epub.py --all --skip-ocr
 
 1. **OCR**: 生成可搜索 PDF 和 sidecar 文本
 2. **LLM 清洗**: 按分页分组调用 `claude -p --output-format json` 清洗文本并合并为 Markdown
-3. **归档旧 EPUB**: 若 `epub/<name>.epub` 已存在，先移到 `archived/epub/`
-4. **EPUB**: Markdown 转最新 EPUB，输出到 `epub/`
-5. **成功清理/归档**: 成功后自动删除 `output/ocr_pdf/*.ocr.pdf` 与 `output/clean_md/*.md`，并把已处理输入 PDF 移到 `archived/pdf/`
+3. **EPUB**: Markdown 转 EPUB，输出到 `output/epub/`
+4. **批次归档旧 EPUB**: 本次运行结束后，`output/epub/` 中所有不属于本批次成功结果的 EPUB 都会移到 `output/archived_epub/`
+5. **成功清理/归档**: 成功后自动删除 `output/ocr_pdf/*.ocr.pdf` 与 `output/clean_md/*.md`，并把已处理输入 PDF 移到 `input/archived_pdf/`
 
 默认情况下，`--all` 只扫描 `input/`，不会处理归档目录中的历史文件。
+
+失败时的当前行为：
+- OCR 或 LLM 清洗失败：输入 PDF 保留在 `input/`，不会归档
+- `output/epub/` 表示“本批次成功生成的 EPUB 结果集”，不是“每本书各自最后一次成功版本”
+- 若本批次只有部分 PDF 成功，则 `output/epub/` 只保留这些成功结果，其他原有 EPUB 会归档到 `output/archived_epub/`
+- 若本批次全部失败，则 `output/epub/` 最终为空。这是当前接受的行为。
 
 ## 运行要求
 
@@ -123,8 +128,9 @@ conda run -n pdf2epub python src/pdf2epub.py --all --skip-ocr
 
 成功处理后，重点检查：
 - `output/sidecar_txt/*.txt` 可供 `--skip-ocr` 复用
-- `epub/*.epub` 可正常打开
-- `archived/pdf/` 中保留已成功处理的输入 PDF
+- `output/epub/*.epub` 可正常打开
+- `input/archived_pdf/` 中保留已成功处理的输入 PDF
+- `output/archived_epub/` 中保留被替换的旧 EPUB
 - `output/logs/run/*.json` 中保留 `input_tokens`、`output_tokens` 等统计字段
 
 不需要把 `output/clean_md/*.md` 是否仍然存在作为默认验收条件，因为成功生成 EPUB 后会自动清理。
@@ -142,4 +148,5 @@ LLM 清洗相比规则清洗的优势：
 - OCR 错字可能仍然存在
 - 复杂版面（双栏、跨栏）可能顺序不完美
 - LLM 清洗仍有 token 成本
-- 默认假设 `input/` 中 PDF 文件名 stem 唯一；同 stem 会共用同一个“最新 EPUB”槽位
+- 默认假设 `input/` 中 PDF 文件名 stem 唯一
+- `output/epub/` 表示最近一次运行中成功产出的结果集；重新运行单本或一批文件时，旧批次结果会被归档到 `output/archived_epub/`
