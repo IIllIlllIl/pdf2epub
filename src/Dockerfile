@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     ghostscript \
+    nodejs \
+    npm \
     ocrmypdf \
     pandoc \
     pngquant \
@@ -19,6 +21,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr-eng \
     unpaper \
  && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @openai/codex
 
 RUN curl -fsSL https://claude.ai/install.sh | bash
 

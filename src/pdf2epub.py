@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PDF to EPUB converter with Claude CLI-based text cleaning.
+"""PDF to EPUB converter with CLI agent-based text cleaning.
 
 Usage:
     conda run -n pdf2epub python src/pdf2epub.py --check-tools
@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -33,7 +34,15 @@ PROMPT_PATH = ROOT / "src" / "clean_prompt.md"
 
 # Settings
 DEFAULT_LANG = "chi_sim+eng"
-TOOL_NAMES = ["python3", "claude", "ocrmypdf", "tesseract", "pandoc"]
+DEFAULT_OCR_ENGINE = "tesseract"
+OCR_ENGINE_CHOICES = ("tesseract",)
+DEFAULT_KEEP_MD = True
+DEFAULT_AGENT = "codex"
+AGENT_CHOICES = ("codex", "claude")
+BASE_TOOL_NAMES = ["python3", "pandoc"]
+OCR_ENGINE_TOOL_NAMES = {
+    "tesseract": ["ocrmypdf", "tesseract"],
+}
 CONTAINER_MARKER = Path("/.dockerenv")
 CLEAN_CHUNK_MAX_CHARS = 8000
 
@@ -46,7 +55,7 @@ class StageResult:
     exit_code: int | None = None
     command: list[str] | None = None
     reused: bool = False
-    stats: dict[str, int] | None = None
+    stats: dict[str, int | str] | None = None
 
     def to_dict(self) -> dict:
         data = {
@@ -104,8 +113,12 @@ def ensure_directories() -> None:
             shutil.rmtree(legacy_chunk_dir)
 
 
-def detect_tools() -> dict[str, str | None]:
-    return {name: shutil.which(name) for name in TOOL_NAMES}
+def tool_names_for_run(ocr_engine: str, agent: str) -> list[str]:
+    return [*BASE_TOOL_NAMES, *OCR_ENGINE_TOOL_NAMES.get(ocr_engine, []), agent]
+
+
+def detect_tools(ocr_engine: str, agent: str) -> dict[str, str | None]:
+    return {name: shutil.which(name) for name in tool_names_for_run(ocr_engine, agent)}
 
 
 def run_command(
@@ -153,6 +166,35 @@ def extract_token_usage(result: dict) -> tuple[int, int]:
             continue
         input_tokens += int(item.get("inputTokens", 0))
         output_tokens += int(item.get("outputTokens", 0))
+    return input_tokens, output_tokens
+
+
+def extract_codex_token_usage(stdout: str) -> tuple[int, int]:
+    input_tokens = 0
+    output_tokens = 0
+
+    def walk(value):
+        nonlocal input_tokens, output_tokens
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized_key = key.replace("-", "_")
+                if normalized_key in {"input_tokens", "inputTokens"} and isinstance(item, int):
+                    input_tokens += item
+                elif normalized_key in {"output_tokens", "outputTokens"} and isinstance(item, int):
+                    output_tokens += item
+                else:
+                    walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        walk(event)
+
     return input_tokens, output_tokens
 
 
@@ -215,6 +257,55 @@ def call_claude_cli(text: str, prompt_template: str) -> tuple[str, dict[str, int
     return cleaned_text, stats
 
 
+def call_codex_cli(text: str, prompt_template: str) -> tuple[str, dict[str, int]]:
+    full_prompt = f"{prompt_template}\n\n# 输入文本\n\n{text}"
+
+    with tempfile.TemporaryDirectory(prefix="pdf2epub-codex-") as temp_dir:
+        output_path = Path(temp_dir) / "last-message.md"
+        command = [
+            "codex", "exec",
+            "--skip-git-repo-check",
+            "--sandbox", "read-only",
+            "--ask-for-approval", "never",
+            "--color", "never",
+            "--json",
+            "--cd", str(ROOT),
+            "--output-last-message", str(output_path),
+            "-",
+        ]
+
+        try:
+            completed = run_command(command, "llm_clean", input_text=full_prompt)
+        except RuntimeError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        cleaned_text = ""
+        if output_path.exists():
+            cleaned_text = output_path.read_text(encoding="utf-8").strip()
+        if not cleaned_text:
+            cleaned_text = completed.stdout.strip()
+        if not cleaned_text:
+            raise RuntimeError("llm_clean: empty output from codex")
+
+        input_tokens, output_tokens = extract_codex_token_usage(completed.stdout)
+
+    stats = {
+        "input_chars": len(text),
+        "output_chars": len(cleaned_text),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
+    return cleaned_text, stats
+
+
+def call_llm_agent(agent: str, text: str, prompt_template: str) -> tuple[str, dict[str, int]]:
+    if agent == "codex":
+        return call_codex_cli(text, prompt_template)
+    if agent == "claude":
+        return call_claude_cli(text, prompt_template)
+    raise RuntimeError(f"llm_clean: unsupported agent: {agent}")
+
+
 def split_sidecar_pages(raw_text: str) -> list[str]:
     return [page.strip() for page in raw_text.split("\f") if page.strip()]
 
@@ -268,16 +359,7 @@ def normalize_chunk_markdown(cleaned: str, title: str, keep_title: bool) -> str:
     return "\n".join(lines).strip()
 
 
-def stage_ocr(input_pdf: Path, ocr_pdf: Path, sidecar_txt: Path, language: str, skip_ocr: bool) -> StageResult:
-    if skip_ocr and sidecar_txt.exists() and sidecar_txt.stat().st_size > 0:
-        reused_output = ocr_pdf if ocr_pdf.exists() else sidecar_txt
-        return StageResult(
-            status="skipped",
-            output=str(reused_output),
-            reused=True,
-            stats={"sidecar_bytes": sidecar_txt.stat().st_size},
-        )
-
+def stage_ocr_tesseract(input_pdf: Path, ocr_pdf: Path, sidecar_txt: Path, language: str) -> StageResult:
     command = [
         "ocrmypdf", "-l", language,
         "--rotate-pages", "--deskew", "--clean",
@@ -292,13 +374,36 @@ def stage_ocr(input_pdf: Path, ocr_pdf: Path, sidecar_txt: Path, language: str, 
         return StageResult(status="failed", error=str(exc), exit_code=code, command=command)
 
     stats = {
+        "ocr_engine": "tesseract",
         "ocr_pdf_bytes": ocr_pdf.stat().st_size if ocr_pdf.exists() else 0,
         "sidecar_bytes": sidecar_txt.stat().st_size if sidecar_txt.exists() else 0,
     }
     return StageResult(status="ok", output=str(ocr_pdf), command=command, stats=stats)
 
 
-def stage_clean_llm(sidecar_txt: Path, markdown_path: Path, title: str) -> StageResult:
+def stage_ocr(
+    input_pdf: Path,
+    ocr_pdf: Path,
+    sidecar_txt: Path,
+    language: str,
+    skip_ocr: bool,
+    ocr_engine: str,
+) -> StageResult:
+    if skip_ocr and sidecar_txt.exists() and sidecar_txt.stat().st_size > 0:
+        reused_output = ocr_pdf if ocr_pdf.exists() else sidecar_txt
+        return StageResult(
+            status="skipped",
+            output=str(reused_output),
+            reused=True,
+            stats={"ocr_engine": ocr_engine, "sidecar_bytes": sidecar_txt.stat().st_size},
+        )
+
+    if ocr_engine == "tesseract":
+        return stage_ocr_tesseract(input_pdf, ocr_pdf, sidecar_txt, language)
+    return StageResult(status="failed", error=f"ocr: unsupported OCR engine: {ocr_engine}")
+
+
+def stage_clean_llm(sidecar_txt: Path, markdown_path: Path, title: str, agent: str) -> StageResult:
     if not sidecar_txt.exists():
         return StageResult(status="failed", error=f"Missing sidecar: {sidecar_txt}")
 
@@ -327,7 +432,7 @@ def stage_clean_llm(sidecar_txt: Path, markdown_path: Path, title: str) -> Stage
 
     for index, chunk in enumerate(chunks, start=1):
         try:
-            cleaned_chunk, chunk_stats = call_claude_cli(chunk, prompt_template)
+            cleaned_chunk, chunk_stats = call_llm_agent(agent, chunk, prompt_template)
         except RuntimeError as exc:
             return StageResult(status="failed", error=f"llm_clean: chunk {index}/{len(chunks)} failed: {exc}")
 
@@ -382,8 +487,12 @@ def stage_epub(markdown_path: Path, epub_path: Path, title: str) -> StageResult:
     )
 
 
-def cleanup_success_outputs(ocr_pdf: Path, markdown_path: Path) -> None:
-    for path in (ocr_pdf, markdown_path):
+def cleanup_success_outputs(ocr_pdf: Path, markdown_path: Path, keep_md: bool) -> None:
+    paths = [ocr_pdf]
+    if not keep_md:
+        paths.append(markdown_path)
+
+    for path in paths:
         if path.exists():
             path.unlink()
 
@@ -430,7 +539,14 @@ def archive_stale_epubs(current_batch_outputs: set[Path]) -> list[str]:
     return archived
 
 
-def process_book(input_pdf: Path, language: str, skip_ocr: bool) -> BookResult:
+def process_book(
+    input_pdf: Path,
+    language: str,
+    skip_ocr: bool,
+    ocr_engine: str,
+    agent: str,
+    keep_md: bool,
+) -> BookResult:
     started_at = datetime.now().isoformat(timespec="seconds")
     base_name = input_pdf.stem
     result = BookResult(
@@ -445,14 +561,14 @@ def process_book(input_pdf: Path, language: str, skip_ocr: bool) -> BookResult:
     markdown_path = MD_DIR / f"{base_name}.md"
     epub_path = OUTPUT_DIR / f"{base_name}.epub"
 
-    ocr_result = stage_ocr(input_pdf, ocr_pdf, sidecar_txt, language, skip_ocr)
+    ocr_result = stage_ocr(input_pdf, ocr_pdf, sidecar_txt, language, skip_ocr, ocr_engine)
     result.stages["ocr"] = ocr_result
     if ocr_result.status == "failed":
         result.status = "failed"
         result.finished_at = datetime.now().isoformat(timespec="seconds")
         return result
 
-    clean_result = stage_clean_llm(sidecar_txt, markdown_path, base_name)
+    clean_result = stage_clean_llm(sidecar_txt, markdown_path, base_name, agent)
     result.stages["llm_clean"] = clean_result
     if clean_result.status == "failed":
         result.status = "failed"
@@ -463,7 +579,7 @@ def process_book(input_pdf: Path, language: str, skip_ocr: bool) -> BookResult:
     result.stages["epub"] = epub_result
     result.status = "ok" if epub_result.status == "ok" else "failed"
     if result.status == "ok":
-        cleanup_success_outputs(ocr_pdf, markdown_path)
+        cleanup_success_outputs(ocr_pdf, markdown_path, keep_md)
         archived_input = archive_input_pdf(input_pdf)
         if archived_input:
             result.stages["archive_input"] = StageResult(status="ok", output=str(archived_input))
@@ -488,10 +604,12 @@ def iter_input_pdfs(single_input: str | None, process_all: bool):
     raise ValueError("Use --input <pdf> or --all")
 
 
-def print_tool_status() -> int:
-    detected = detect_tools()
+def print_tool_status(ocr_engine: str, agent: str) -> int:
+    detected = detect_tools(ocr_engine, agent)
     missing = [name for name, path in detected.items() if not path]
     print(f"container_env: {'yes' if CONTAINER_MARKER.exists() else 'no'}")
+    print(f"ocr_engine: {ocr_engine}")
+    print(f"llm_agent: {agent}")
     for name, path in detected.items():
         print(f"{name}: {path or 'MISSING'}")
     return 1 if missing else 0
@@ -499,7 +617,7 @@ def print_tool_status() -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="OCR scanned PDFs and convert to EPUB with Claude CLI cleaning.",
+        description="OCR scanned PDFs and convert to EPUB with CLI agent cleaning.",
         epilog=(
             "Usage:\n"
             "  conda run -n pdf2epub python src/pdf2epub.py --check-tools\n"
@@ -511,7 +629,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", help="Process a single PDF file.")
     parser.add_argument("--all", action="store_true", help="Process all PDFs in input/.")
     parser.add_argument("--skip-ocr", action="store_true", help="Reuse existing sidecar text.")
+    parser.add_argument(
+        "--keep-md",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_KEEP_MD,
+        help=f"Keep intermediate Markdown after successful EPUB generation. Default: {DEFAULT_KEEP_MD}",
+    )
     parser.add_argument("--lang", default=DEFAULT_LANG, help=f"OCR language. Default: {DEFAULT_LANG}")
+    parser.add_argument(
+        "--ocr-engine",
+        choices=OCR_ENGINE_CHOICES,
+        default=DEFAULT_OCR_ENGINE,
+        help=f"OCR engine. Default: {DEFAULT_OCR_ENGINE}",
+    )
+    parser.add_argument(
+        "--agent",
+        choices=AGENT_CHOICES,
+        default=DEFAULT_AGENT,
+        help=f"LLM agent for text cleaning. Default: {DEFAULT_AGENT}",
+    )
     parser.add_argument("--check-tools", action="store_true", help="Check tool availability.")
     return parser.parse_args()
 
@@ -521,7 +657,7 @@ def main() -> int:
     ensure_directories()
 
     if args.check_tools:
-        return print_tool_status()
+        return print_tool_status(args.ocr_engine, args.agent)
 
     try:
         inputs = list(iter_input_pdfs(args.input, args.all))
@@ -539,7 +675,10 @@ def main() -> int:
         "run_id": run_id,
         "started_at": started_at,
         "language": args.lang,
+        "ocr_engine": args.ocr_engine,
         "skip_ocr": args.skip_ocr,
+        "keep_md": args.keep_md,
+        "llm_agent": args.agent,
         "inputs": [str(p) for p in inputs],
         "retention_mode": "batch_latest",
         "books": [],
@@ -548,7 +687,7 @@ def main() -> int:
     had_failure = False
     successful_epubs: set[Path] = set()
     for input_pdf in inputs:
-        book_result = process_book(input_pdf, args.lang, args.skip_ocr)
+        book_result = process_book(input_pdf, args.lang, args.skip_ocr, args.ocr_engine, args.agent, args.keep_md)
         summary["books"].append(book_result.to_dict())
         if book_result.status != "ok":
             had_failure = True
