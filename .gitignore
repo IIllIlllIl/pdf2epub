@@ -5,16 +5,24 @@
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+.venv/
+venv/
 
 # Local tooling
 .claude/
+.codex/
 tmp/
 
-# Inputs and generated outputs
+# Local data and generated outputs
 input/
+output/
 epub/
 archived/
-output/
+
+# Local voice samples may contain third-party audio and large binaries.
+voices/*
+!voices/README.md
 
 # Environment files
 .env
