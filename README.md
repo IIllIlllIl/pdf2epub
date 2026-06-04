@@ -24,7 +24,8 @@ pdf2epub/
     ocr_pdf/           # OCR 后 PDF（成功后自动清理）
     sidecar_txt/       # OCR 原始文本（可供 --skip-ocr 复用）
     clean_md/          # 清洗后 Markdown（默认保留，可用 --no-keep-md 清理）
-    audio/             # Markdown 朗读音频
+    audio/             # 最新生成的 Markdown 朗读音频
+    archived_audio/    # 被替换的旧 WAV
     voice_gallery.html # 本地候选说话人选择页
     logs/run/          # 运行日志
     logs/audio/        # 音频生成日志
@@ -144,12 +145,12 @@ conda run -n pdf2epub python src/pdf2epub.py --import-fish-voice 0f08cacd3e35447
 |------|------|
 | `--input <pdf>` | 处理单个 PDF |
 | `--all` | 处理 `input/` 下全部 PDF（运行后 `output/epub/` 仅保留本批次成功结果） |
-| `--md-input <md>` | 从单个 Markdown 生成音频 |
+| `--md-input <md>` | 从 Markdown 生成音频；可重复传入多个文件以作为同一音频批次处理 |
 | `--all-md` | 从 `output/clean_md/` 下全部 Markdown 生成音频 |
 | `--skip-ocr` | 复用已有 sidecar 文本 |
 | `--md-only` | 只运行 OCR 和 LLM 清洗，生成 `output/clean_md/*.md` 后停止；不生成 EPUB/音频，不归档输入 PDF |
 | `--audio` | PDF 转 EPUB 成功后继续生成音频 |
-| `--audio-only` | 只从 Markdown 生成音频，不跑 OCR/LLM/EPUB；成功后若 `input/` 下存在同名 PDF，会归档该 PDF |
+| `--audio-only` | 只从 Markdown 生成音频，不跑 OCR/LLM/EPUB；运行后 `output/audio/` 仅保留本批次成功结果，成功后若 `input/` 下存在同名 PDF，会归档该 PDF |
 | `--keep-md` / `--no-keep-md` | 是否保留中间 Markdown，默认保留；使用 `--no-keep-md` 可在成功后删除 |
 | `--lang <lang>` | OCR 语言，默认 `chi_sim+eng`；例如英文可用 `eng`，繁体中文可用 `chi_tra+eng`，取决于本机 Tesseract 语言包 |
 | `--ocr-engine <tesseract>` | OCR engine，默认 `tesseract`；当前通过 `ocrmypdf` 调用 Tesseract |
@@ -176,17 +177,20 @@ conda run -n pdf2epub python src/pdf2epub.py --import-fish-voice 0f08cacd3e35447
 2. **LLM 清洗**: 按分页分组调用所选 agent 清洗文本并合并为 Markdown；默认调用 `codex exec`，传入 `--agent claude` 时调用 `claude -p --output-format json`
 3. **Markdown-only（可选）**: 传入 `--md-only` 时到此停止，保留输入 PDF 和中间 Markdown，不生成 EPUB/音频，也不归档旧 EPUB
 4. **EPUB**: Markdown 转 EPUB，输出到 `output/epub/`
-5. **音频生成（可选）**: `--audio` 或 `--audio-only` 会启动一个常驻 TTS worker，加载一次 `fish-s2-pro`，再把 Markdown 规整、分段，逐段生成 wav，最后合并为 `output/audio/*.wav`
+5. **音频生成（可选）**: `--audio` 或 `--audio-only` 会启动一个常驻 TTS worker，加载一次 `fish-s2-pro`，再把 Markdown 规整、分段，逐段生成 wav，最后合并为 `output/audio/*.wav`；若同名 wav 已存在，旧文件会先归档到 `output/archived_audio/`
 6. **批次归档旧 EPUB**: 本次运行结束后，`output/epub/` 中所有不属于本批次成功结果的 EPUB 都会移到 `output/archived_epub/`
-7. **成功清理/归档**: 成功后自动删除 `output/ocr_pdf/*.ocr.pdf`，默认保留 `output/clean_md/*.md`；传入 `--no-keep-md` 时也会删除中间 Markdown，并把已处理输入 PDF 移到 `input/archived_pdf/`
-8. **Audio-only 输入归档**: `--audio-only` 成功后，会按 Markdown 文件名在 `input/` 顶层查找同名 PDF；找到时归档到 `input/archived_pdf/`
+7. **批次归档旧 WAV**: 生成音频的运行结束后，`output/audio/` 中所有不属于本批次成功结果的 wav 都会移到 `output/archived_audio/`
+8. **成功清理/归档**: 成功后自动删除 `output/ocr_pdf/*.ocr.pdf`，默认保留 `output/clean_md/*.md`；传入 `--no-keep-md` 时也会删除中间 Markdown，并把已处理输入 PDF 移到 `input/archived_pdf/`
+9. **Audio-only 输入归档**: `--audio-only` 成功后，会按 Markdown 文件名在 `input/` 顶层查找同名 PDF；找到时归档到 `input/archived_pdf/`
 
 默认情况下，`--all` 只扫描 `input/`，不会处理归档目录中的历史文件。
 
 失败时的当前行为：
 - OCR 或 LLM 清洗失败：输入 PDF 保留在 `input/`，不会归档
 - `output/epub/` 表示“本批次成功生成的 EPUB 结果集”，不是“每本书各自最后一次成功版本”
+- `output/audio/` 表示“本批次成功生成的 WAV 结果集”，不是“每本书各自最后一次成功版本”
 - 若本批次只有部分 PDF 成功，则 `output/epub/` 只保留这些成功结果，其他原有 EPUB 会归档到 `output/archived_epub/`
+- 若本批次只有部分音频成功，则 `output/audio/` 只保留这些成功结果，其他原有 WAV 会归档到 `output/archived_audio/`
 - 若本批次全部失败，则 `output/epub/` 最终为空。这是当前接受的行为。
 
 ## 运行要求
@@ -263,6 +267,7 @@ conda run -n pdf2epub python src/pdf2epub.py --import-fish-voice <model_id_or_ur
 - `output/audio/*.wav` 可正常播放（使用 `--audio` 或 `--audio-only` 时）
 - `input/archived_pdf/` 中保留已成功处理的输入 PDF
 - `output/archived_epub/` 中保留被替换的旧 EPUB
+- `output/archived_audio/` 中保留被替换的旧 WAV
 - `output/logs/run/*.json` 中保留 `input_tokens`、`output_tokens` 等统计字段
 
 默认应检查 `output/clean_md/*.md` 是否保留；只有显式使用 `--no-keep-md` 时，成功生成 EPUB 后才会自动清理。
@@ -282,3 +287,4 @@ LLM 清洗相比规则清洗的优势：
 - LLM 清洗仍有 token 成本
 - 默认假设 `input/` 中 PDF 文件名 stem 唯一
 - `output/epub/` 表示最近一次运行中成功产出的结果集；重新运行单本或一批文件时，旧批次结果会被归档到 `output/archived_epub/`
+- `output/audio/` 表示最近一次音频运行中成功产出的结果集；重新运行单本或一批 Markdown 时，旧批次 WAV 会被归档到 `output/archived_audio/`

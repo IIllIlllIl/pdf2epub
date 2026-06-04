@@ -24,7 +24,8 @@ pdf2epub/
     ocr_pdf/           # OCR PDFs; cleaned after successful full runs
     sidecar_txt/       # OCR text, reusable with --skip-ocr
     clean_md/          # Cleaned Markdown, kept by default
-    audio/             # Narrated WAV audio
+    audio/             # Latest narrated WAV audio
+    archived_audio/    # Replaced WAV outputs
     voice_gallery.html # Local voice selection page
     logs/run/          # PDF/EPUB run logs
     logs/audio/        # Audio generation logs
@@ -124,12 +125,12 @@ conda run -n pdf2epub python src/pdf2epub.py --import-fish-voice 0f08cacd3e35447
 |------|------|
 | `--input <pdf>` | Process one PDF. |
 | `--all` | Process all top-level PDFs in `input/`. |
-| `--md-input <md>` | Generate audio from one Markdown file. |
+| `--md-input <md>` | Generate audio from Markdown. Repeat it to process multiple files in one audio batch. |
 | `--all-md` | Generate audio from all Markdown files in `output/clean_md/`. |
 | `--skip-ocr` | Reuse existing sidecar OCR text. |
 | `--md-only` | Run OCR and LLM cleanup only; skip EPUB, audio, and input archiving. |
 | `--audio` | Generate audio after PDF -> EPUB succeeds. |
-| `--audio-only` | Generate audio from Markdown only. If a same-stem PDF exists in `input/`, archive it after successful audio generation. |
+| `--audio-only` | Generate audio from Markdown only. `output/audio/` keeps only this run's successful outputs. If a same-stem PDF exists in `input/`, archive it after successful audio generation. |
 | `--keep-md` / `--no-keep-md` | Keep intermediate Markdown. Default: keep. |
 | `--lang <lang>` | Tesseract OCR language. Default: `chi_sim+eng`. Use `eng` for English, `chi_tra+eng` for Traditional Chinese if installed. |
 | `--ocr-engine <tesseract>` | OCR backend. Currently only `tesseract`. |
@@ -156,9 +157,10 @@ conda run -n pdf2epub python src/pdf2epub.py --import-fish-voice 0f08cacd3e35447
 2. **LLM cleanup**: sidecar text is grouped by pages and cleaned by the selected CLI agent into Markdown.
 3. **Markdown-only**: with `--md-only`, stop here and keep the input PDF in place.
 4. **EPUB**: `pandoc` converts Markdown into EPUB.
-5. **Audio**: `--audio` or `--audio-only` starts one persistent TTS worker and reuses the loaded Fish S2 Pro model across chunks/files.
+5. **Audio**: `--audio` or `--audio-only` starts one persistent TTS worker and reuses the loaded Fish S2 Pro model across chunks/files. If a same-name WAV already exists, it is archived to `output/archived_audio/` before the new WAV is placed in `output/audio/`.
 6. **Archive stale EPUBs**: `output/epub/` keeps only the latest successful batch; older EPUBs move to `output/archived_epub/`.
-7. **Archive inputs**: successful full PDF runs move processed PDFs to `input/archived_pdf/`. Successful `--audio-only` runs also archive a same-stem PDF if it exists in `input/`.
+7. **Archive stale WAVs**: audio runs keep only the latest successful batch in `output/audio/`; older WAVs move to `output/archived_audio/`.
+8. **Archive inputs**: successful full PDF runs move processed PDFs to `input/archived_pdf/`. Successful `--audio-only` runs also archive a same-stem PDF if it exists in `input/`.
 
 ## Local Voice Selection
 
@@ -214,6 +216,7 @@ This keeps large files, private PDFs, generated audio, logs, and third-party voi
 - `output/epub/*.epub` opens correctly.
 - `output/audio/*.wav` plays correctly when audio is generated.
 - `input/archived_pdf/` contains successfully processed input PDFs.
+- `output/archived_audio/` contains replaced WAV outputs.
 - Run logs include token usage and stage outputs.
 
 ## Known Limits
@@ -223,3 +226,4 @@ This keeps large files, private PDFs, generated audio, logs, and third-party voi
 - LLM cleanup consumes Codex/Claude tokens.
 - `input/` PDF filename stems are assumed to be unique.
 - `output/epub/` represents the latest successful batch, not a permanent archive of all outputs.
+- `output/audio/` represents the latest successful audio batch; previous WAV outputs are archived to `output/archived_audio/`.

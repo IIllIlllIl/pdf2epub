@@ -39,6 +39,7 @@ AUDIO_DIR = ROOT / "output" / "audio"
 AUDIO_PARTS_DIR = AUDIO_DIR / "parts"
 VOICES_DIR = ROOT / "voices"
 ARCHIVED_EPUB_DIR = ROOT / "output" / "archived_epub"
+ARCHIVED_AUDIO_DIR = ROOT / "output" / "archived_audio"
 LOG_DIR = ROOT / "output" / "logs" / "run"
 AUDIO_LOG_DIR = ROOT / "output" / "logs" / "audio"
 VOICE_GALLERY_PATH = ROOT / "output" / "voice_gallery.html"
@@ -136,6 +137,7 @@ def ensure_directories() -> None:
         AUDIO_PARTS_DIR,
         VOICES_DIR,
         ARCHIVED_EPUB_DIR,
+        ARCHIVED_AUDIO_DIR,
         LOG_DIR,
         AUDIO_LOG_DIR,
         CSS_PATH.parent,
@@ -1041,10 +1043,14 @@ def stage_audio_fish_mlx(
             "part": str(part_path),
         })
 
+    merged_audio_path = parts_dir / "__merged.wav"
     try:
-        combine_wav_files(part_paths, audio_path)
+        combine_wav_files(part_paths, merged_audio_path)
     except RuntimeError as exc:
         return StageResult(status="failed", error=str(exc))
+
+    archived_existing = archive_existing_audio(audio_path)
+    shutil.move(str(merged_audio_path), str(audio_path))
 
     duration_seconds = 0.0
     with wave.open(str(audio_path), "rb") as output_wav:
@@ -1070,16 +1076,20 @@ def stage_audio_fish_mlx(
     if not keep_audio_parts:
         shutil.rmtree(parts_dir)
 
+    stats = {
+        "audio_engine": "fish-mlx",
+        "chunks": len(chunks),
+        "duration_seconds": round(duration_seconds, 3),
+        "audio_bytes": audio_path.stat().st_size if audio_path.exists() else 0,
+        "manifest": str(manifest_path),
+    }
+    if archived_existing:
+        stats["archived_existing_audio"] = str(archived_existing)
+
     return StageResult(
         status="ok",
         output=str(audio_path),
-        stats={
-            "audio_engine": "fish-mlx",
-            "chunks": len(chunks),
-            "duration_seconds": round(duration_seconds, 3),
-            "audio_bytes": audio_path.stat().st_size if audio_path.exists() else 0,
-            "manifest": str(manifest_path),
-        },
+        stats=stats,
     )
 
 
@@ -1150,6 +1160,10 @@ def archive_existing_epub(epub_path: Path) -> Path | None:
     return archive_file(epub_path, ARCHIVED_EPUB_DIR)
 
 
+def archive_existing_audio(audio_path: Path) -> Path | None:
+    return archive_file(audio_path, ARCHIVED_AUDIO_DIR)
+
+
 def archive_input_pdf(input_pdf: Path) -> Path | None:
     try:
         input_pdf.resolve().relative_to(INPUT_DIR.resolve())
@@ -1172,6 +1186,18 @@ def archive_stale_epubs(current_batch_outputs: set[Path]) -> list[str]:
         if epub_path.resolve() in current_batch_resolved:
             continue
         archived_path = archive_file(epub_path, ARCHIVED_EPUB_DIR)
+        if archived_path:
+            archived.append(str(archived_path))
+    return archived
+
+
+def archive_stale_audio(current_batch_outputs: set[Path]) -> list[str]:
+    archived: list[str] = []
+    current_batch_resolved = {path.resolve() for path in current_batch_outputs}
+    for audio_path in sorted(AUDIO_DIR.glob("*.wav")):
+        if audio_path.resolve() in current_batch_resolved:
+            continue
+        archived_path = archive_file(audio_path, ARCHIVED_AUDIO_DIR)
         if archived_path:
             archived.append(str(archived_path))
     return archived
@@ -1281,21 +1307,22 @@ def iter_input_pdfs(single_input: str | None, process_all: bool):
     raise ValueError("Use --input <pdf> or --all")
 
 
-def iter_markdown_inputs(single_input: str | None, process_all: bool):
-    if single_input:
-        candidate = Path(single_input).expanduser()
-        if not candidate.is_absolute():
-            candidate = (ROOT / candidate).resolve()
-        if not candidate.exists():
-            raise FileNotFoundError(f"Markdown not found: {candidate}")
-        yield candidate
+def iter_markdown_inputs(single_inputs: list[str] | None, process_all: bool):
+    if single_inputs:
+        for single_input in single_inputs:
+            candidate = Path(single_input).expanduser()
+            if not candidate.is_absolute():
+                candidate = (ROOT / candidate).resolve()
+            if not candidate.exists():
+                raise FileNotFoundError(f"Markdown not found: {candidate}")
+            yield candidate
         return
 
     if process_all:
         yield from sorted(MD_DIR.glob("*.md"))
         return
 
-    raise ValueError("Use --md-input <md> or --all-md")
+    raise ValueError("Use --md-input <md> [--md-input <md> ...] or --all-md")
 
 
 def process_markdown_audio(
@@ -1550,7 +1577,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--input", help="Process a single PDF file.")
     parser.add_argument("--all", action="store_true", help="Process all PDFs in input/.")
-    parser.add_argument("--md-input", help="Generate audio from a single Markdown file.")
+    parser.add_argument("--md-input", action="append", help="Generate audio from a Markdown file. Repeat to process multiple Markdown files in one audio batch.")
     parser.add_argument("--all-md", action="store_true", help="Generate audio from all Markdown files in output/clean_md/.")
     parser.add_argument("--skip-ocr", action="store_true", help="Reuse existing sidecar text.")
     parser.add_argument("--md-only", action="store_true", help="Run OCR and LLM clean only; skip EPUB, audio, and archiving.")
@@ -1681,8 +1708,10 @@ def main() -> int:
             "inputs": [str(path) for path in markdown_inputs],
             "results": [],
             "archived_inputs": [],
+            "retention_mode": "batch_latest",
         }
 
+        successful_audio: set[Path] = set()
         try:
             with TTSWorkerClient(conda_env=args.tts_conda_env, model=args.tts_model) as tts_worker:
                 for markdown_path in markdown_inputs:
@@ -1703,6 +1732,8 @@ def main() -> int:
                     if audio_result.status != "ok":
                         had_failure = True
                     else:
+                        if audio_result.output:
+                            successful_audio.add(Path(audio_result.output))
                         input_pdf = find_input_pdf_for_markdown(markdown_path)
                         if input_pdf is not None:
                             archived_input = archive_input_pdf(input_pdf)
@@ -1720,6 +1751,9 @@ def main() -> int:
             print(str(exc), file=sys.stderr)
             return 1
 
+        archived_audio = archive_stale_audio(successful_audio)
+        audio_summary["batch_audio_outputs"] = [str(path) for path in sorted(successful_audio)]
+        audio_summary["archived_audio"] = archived_audio
         audio_summary["finished_at"] = datetime.now().isoformat(timespec="seconds")
         summary_path = AUDIO_LOG_DIR / f"{run_id}.json"
         summary_path.write_text(json.dumps(audio_summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1758,6 +1792,7 @@ def main() -> int:
 
     had_failure = False
     successful_epubs: set[Path] = set()
+    successful_audio: set[Path] = set()
     try:
         tts_context = TTSWorkerClient(conda_env=args.tts_conda_env, model=args.tts_model) if args.audio else nullcontext(None)
         with tts_context as tts_worker:
@@ -1789,6 +1824,9 @@ def main() -> int:
                     epub_stage = (book_result.stages or {}).get("epub")
                     if epub_stage and epub_stage.output:
                         successful_epubs.add(Path(epub_stage.output))
+                    audio_stage = (book_result.stages or {}).get("audio")
+                    if audio_stage and audio_stage.output:
+                        successful_audio.add(Path(audio_stage.output))
 
                 status = book_result.status.upper()
                 print(f"[{status}] {input_pdf.name}")
@@ -1800,8 +1838,11 @@ def main() -> int:
         return 1
 
     archived_epubs = [] if args.md_only else archive_stale_epubs(successful_epubs)
+    archived_audio = archive_stale_audio(successful_audio) if args.audio else []
     summary["batch_epub_outputs"] = [str(path) for path in sorted(successful_epubs)]
     summary["archived_epubs"] = archived_epubs
+    summary["batch_audio_outputs"] = [str(path) for path in sorted(successful_audio)]
+    summary["archived_audio"] = archived_audio
 
     summary["finished_at"] = datetime.now().isoformat(timespec="seconds")
     summary_path = LOG_DIR / f"{run_id}.json"
