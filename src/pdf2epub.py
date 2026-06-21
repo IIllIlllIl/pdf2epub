@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -18,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -51,14 +53,15 @@ DEFAULT_LANG = "chi_sim+eng"
 DEFAULT_OCR_ENGINE = "tesseract"
 OCR_ENGINE_CHOICES = ("tesseract",)
 DEFAULT_KEEP_MD = True
-DEFAULT_AGENT = "codex"
-AGENT_CHOICES = ("codex", "claude")
+DEFAULT_AGENT = "claude"
+AGENT_CHOICES = ("codex", "claude", "opencode")
 DEFAULT_TTS_ENGINE = "fish-mlx"
 TTS_ENGINE_CHOICES = ("fish-mlx",)
 DEFAULT_TTS_CONDA_ENV = "tts-mlx"
 DEFAULT_TTS_MODEL = "fish-s2-pro"
 DEFAULT_TTS_CHUNK_CHARS = 120
 DEFAULT_TTS_MAX_NEW_TOKENS = 512
+DEFAULT_TTS_MAX_RUNTIME_HOURS = 5.0
 DEFAULT_AUDIO_FORMAT = "wav"
 SUPPORTED_AUDIO_FORMATS = ("wav",)
 TTS_WORKER_PATH = ROOT / "src" / "tts_worker.py"
@@ -755,11 +758,77 @@ def call_codex_cli(text: str, prompt_template: str) -> tuple[str, dict[str, int]
     return cleaned_text, stats
 
 
+def call_opencode_cli(text: str, prompt_template: str) -> tuple[str, dict[str, int]]:
+    full_prompt = f"{prompt_template}\n\n# 输入文本\n\n{text}"
+    command = [
+        "opencode", "run",
+        "--format", "json",
+        "--dangerously-skip-permissions",
+        "-",
+    ]
+
+    try:
+        completed = run_command(command, "llm_clean", input_text=full_prompt)
+    except RuntimeError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    cleaned_text = ""
+    input_tokens = 0
+    output_tokens = 0
+    error_message = ""
+    for line in completed.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        event_type = event.get("type")
+        if event_type == "text":
+            part = event.get("part") or {}
+            if isinstance(part, dict):
+                cleaned_text += str(part.get("text", ""))
+        elif event_type == "step_finish":
+            part = event.get("part") or {}
+            tokens = part.get("tokens") if isinstance(part, dict) else None
+            if isinstance(tokens, dict):
+                input_tokens = int(tokens.get("input", 0))
+                output_tokens = int(tokens.get("output", 0))
+        elif event_type == "error":
+            err = event.get("error") or {}
+            if isinstance(err, dict):
+                msg = err.get("message") or err.get("name")
+                data = err.get("data")
+                if not msg and isinstance(data, dict):
+                    msg = data.get("message")
+                if msg:
+                    error_message = str(msg)
+            if not error_message and isinstance(event.get("error"), str):
+                error_message = event.get("error")
+
+    cleaned_text = cleaned_text.strip()
+    if not cleaned_text:
+        if error_message:
+            raise RuntimeError(f"llm_clean: opencode error: {error_message}")
+        raise RuntimeError("llm_clean: empty output from opencode")
+
+    stats = {
+        "input_chars": len(text),
+        "output_chars": len(cleaned_text),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
+    return cleaned_text, stats
+
+
 def call_llm_agent(agent: str, text: str, prompt_template: str) -> tuple[str, dict[str, int]]:
     if agent == "codex":
         return call_codex_cli(text, prompt_template)
     if agent == "claude":
         return call_claude_cli(text, prompt_template)
+    if agent == "opencode":
+        return call_opencode_cli(text, prompt_template)
     raise RuntimeError(f"llm_clean: unsupported agent: {agent}")
 
 
@@ -863,7 +932,13 @@ def stage_ocr(
     return StageResult(status="failed", error=f"ocr: unsupported OCR engine: {ocr_engine}")
 
 
-def stage_clean_llm(sidecar_txt: Path, markdown_path: Path, title: str, agent: str) -> StageResult:
+def stage_clean_llm(
+    sidecar_txt: Path,
+    markdown_path: Path,
+    title: str,
+    agent: str,
+    fallback_agent: str | None = None,
+) -> StageResult:
     if not sidecar_txt.exists():
         return StageResult(status="failed", error=f"Missing sidecar: {sidecar_txt}")
 
@@ -889,12 +964,27 @@ def stage_clean_llm(sidecar_txt: Path, markdown_path: Path, title: str, agent: s
         "input_tokens": 0,
         "output_tokens": 0,
     }
+    fallback_chunks: list[int] = []
 
     for index, chunk in enumerate(chunks, start=1):
         try:
             cleaned_chunk, chunk_stats = call_llm_agent(agent, chunk, prompt_template)
         except RuntimeError as exc:
-            return StageResult(status="failed", error=f"llm_clean: chunk {index}/{len(chunks)} failed: {exc}")
+            error_text = str(exc)
+            if fallback_agent and ("high risk" in error_text.lower() or "rejected" in error_text.lower()):
+                try:
+                    cleaned_chunk, chunk_stats = call_llm_agent(fallback_agent, chunk, prompt_template)
+                except RuntimeError as fallback_exc:
+                    return StageResult(
+                        status="failed",
+                        error=(
+                            f"llm_clean: chunk {index}/{len(chunks)} failed primary ({exc}) "
+                            f"and fallback ({fallback_exc})"
+                        ),
+                    )
+                fallback_chunks.append(index)
+            else:
+                return StageResult(status="failed", error=f"llm_clean: chunk {index}/{len(chunks)} failed: {exc}")
 
         aggregated_stats["input_chars"] += chunk_stats.get("input_chars", 0)
         aggregated_stats["input_tokens"] += chunk_stats.get("input_tokens", 0)
@@ -915,6 +1005,9 @@ def stage_clean_llm(sidecar_txt: Path, markdown_path: Path, title: str, agent: s
 
     aggregated_stats["output_chars"] = len(cleaned)
     aggregated_stats["output_paragraphs"] = len([p for p in cleaned.split("\n\n") if p.strip()])
+    if fallback_chunks:
+        aggregated_stats["fallback_chunks"] = fallback_chunks
+        aggregated_stats["fallback_agent"] = fallback_agent
     return StageResult(status="ok", output=str(markdown_path), stats=aggregated_stats)
 
 
@@ -972,6 +1065,35 @@ def combine_wav_files(part_paths: list[Path], output_path: Path) -> None:
                 output_wav.writeframes(part_wav.readframes(part_wav.getnframes()))
 
 
+def is_valid_wav(path: Path) -> bool:
+    try:
+        with wave.open(str(path), "rb") as wav_file:
+            return wav_file.getnframes() > 0 and wav_file.getframerate() > 0
+    except (OSError, EOFError, wave.Error):
+        return False
+
+
+def audio_resume_signature(
+    *,
+    chunks: list[str],
+    tts_model: str,
+    tts_chunk_chars: int,
+    tts_reference_audio: str | None,
+    tts_reference_text: str | None,
+    tts_max_new_tokens: int | None,
+) -> str:
+    payload = {
+        "chunks": chunks,
+        "tts_model": tts_model,
+        "tts_chunk_chars": tts_chunk_chars,
+        "tts_reference_audio": tts_reference_audio,
+        "tts_reference_text": tts_reference_text,
+        "tts_max_new_tokens": tts_max_new_tokens,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def stage_audio_fish_mlx(
     markdown_path: Path,
     audio_path: Path,
@@ -985,6 +1107,7 @@ def stage_audio_fish_mlx(
     tts_reference_audio: str | None,
     tts_reference_text: str | None,
     tts_max_new_tokens: int | None,
+    tts_deadline: float | None,
 ) -> StageResult:
     if not markdown_path.exists():
         return StageResult(status="failed", error=f"Missing markdown: {markdown_path}")
@@ -1000,14 +1123,91 @@ def stage_audio_fish_mlx(
 
     safe_title = "".join(char if char.isalnum() or char in "._-" else "_" for char in title).strip("_") or "audio"
     parts_dir = AUDIO_PARTS_DIR / safe_title
-    if parts_dir.exists():
-        shutil.rmtree(parts_dir)
     parts_dir.mkdir(parents=True, exist_ok=True)
+    progress_path = parts_dir / "progress.json"
+    resume_signature = audio_resume_signature(
+        chunks=chunks,
+        tts_model=tts_model,
+        tts_chunk_chars=tts_chunk_chars,
+        tts_reference_audio=tts_reference_audio,
+        tts_reference_text=tts_reference_text,
+        tts_max_new_tokens=tts_max_new_tokens,
+    )
+    manifest_path = AUDIO_LOG_DIR / f"{safe_title}.json"
+    if audio_path.exists() and is_valid_wav(audio_path) and manifest_path.exists():
+        try:
+            existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing_manifest = {}
+        if existing_manifest.get("resume_signature") == resume_signature:
+            with wave.open(str(audio_path), "rb") as output_wav:
+                duration_seconds = output_wav.getnframes() / float(output_wav.getframerate())
+            return StageResult(
+                status="ok",
+                output=str(audio_path),
+                reused=True,
+                stats={
+                    "audio_engine": "fish-mlx",
+                    "chunks": len(chunks),
+                    "duration_seconds": round(duration_seconds, 3),
+                    "audio_bytes": audio_path.stat().st_size,
+                    "manifest": str(manifest_path),
+                },
+            )
+
+    reset_parts = False
+    if progress_path.exists():
+        try:
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+            reset_parts = progress.get("signature") != resume_signature
+        except (OSError, json.JSONDecodeError):
+            reset_parts = True
+    if reset_parts:
+        shutil.rmtree(parts_dir)
+        parts_dir.mkdir(parents=True, exist_ok=True)
+
+    progress_path.write_text(
+        json.dumps(
+            {
+                "source_markdown": str(markdown_path),
+                "signature": resume_signature,
+                "chunks": len(chunks),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     part_paths: list[Path] = []
     chunk_records: list[dict[str, str | int]] = []
+    reused_parts = 0
     for index, chunk in enumerate(chunks, start=1):
         part_path = parts_dir / f"{index:04d}.wav"
+        if is_valid_wav(part_path):
+            reused_parts += 1
+            part_paths.append(part_path)
+            chunk_records.append({
+                "index": index,
+                "chars": len(chunk),
+                "text": chunk,
+                "part": str(part_path),
+            })
+            continue
+        if part_path.exists():
+            part_path.unlink()
+        if tts_deadline is not None and time.monotonic() >= tts_deadline:
+            return StageResult(
+                status="paused",
+                error=f"audio: runtime limit reached before chunk {index}/{len(chunks)}; rerun the same command to resume",
+                stats={
+                    "chunks": len(chunks),
+                    "completed_parts": len(part_paths),
+                    "reused_parts": reused_parts,
+                    "parts_dir": str(parts_dir),
+                },
+            )
         try:
             if tts_worker is not None:
                 tts_worker.synthesize(
@@ -1056,7 +1256,6 @@ def stage_audio_fish_mlx(
     with wave.open(str(audio_path), "rb") as output_wav:
         duration_seconds = output_wav.getnframes() / float(output_wav.getframerate())
 
-    manifest_path = AUDIO_LOG_DIR / f"{safe_title}.json"
     manifest = {
         "title": title,
         "source_markdown": str(markdown_path),
@@ -1067,6 +1266,7 @@ def stage_audio_fish_mlx(
         "tts_chunk_chars": tts_chunk_chars,
         "tts_reference_audio": tts_reference_audio,
         "tts_reference_text": tts_reference_text,
+        "resume_signature": resume_signature,
         "chunks": chunk_records,
         "duration_seconds": duration_seconds,
         "audio_bytes": audio_path.stat().st_size if audio_path.exists() else 0,
@@ -1082,6 +1282,7 @@ def stage_audio_fish_mlx(
         "duration_seconds": round(duration_seconds, 3),
         "audio_bytes": audio_path.stat().st_size if audio_path.exists() else 0,
         "manifest": str(manifest_path),
+        "reused_parts": reused_parts,
     }
     if archived_existing:
         stats["archived_existing_audio"] = str(archived_existing)
@@ -1108,6 +1309,7 @@ def stage_audio(
     tts_reference_audio: str | None = None,
     tts_reference_text: str | None = None,
     tts_max_new_tokens: int | None = None,
+    tts_deadline: float | None = None,
 ) -> StageResult:
     if audio_format != "wav":
         return StageResult(status="failed", error=f"audio: unsupported audio format: {audio_format}")
@@ -1124,6 +1326,7 @@ def stage_audio(
             tts_reference_audio=tts_reference_audio,
             tts_reference_text=tts_reference_text,
             tts_max_new_tokens=tts_max_new_tokens,
+            tts_deadline=tts_deadline,
         )
     return StageResult(status="failed", error=f"audio: unsupported TTS engine: {tts_engine}")
 
@@ -1209,6 +1412,7 @@ def process_book(
     skip_ocr: bool,
     ocr_engine: str,
     agent: str,
+    fallback_agent: str | None,
     keep_md: bool,
     md_only: bool,
     generate_audio: bool,
@@ -1222,6 +1426,7 @@ def process_book(
     tts_reference_audio: str | None,
     tts_reference_text: str | None,
     tts_max_new_tokens: int | None,
+    tts_deadline: float | None,
 ) -> BookResult:
     started_at = datetime.now().isoformat(timespec="seconds")
     base_name = input_pdf.stem
@@ -1246,7 +1451,7 @@ def process_book(
         result.finished_at = datetime.now().isoformat(timespec="seconds")
         return result
 
-    clean_result = stage_clean_llm(sidecar_txt, markdown_path, display_title, agent)
+    clean_result = stage_clean_llm(sidecar_txt, markdown_path, display_title, agent, fallback_agent)
     result.stages["llm_clean"] = clean_result
     if clean_result.status == "failed":
         result.status = "failed"
@@ -1277,6 +1482,7 @@ def process_book(
             tts_reference_audio=tts_reference_audio,
             tts_reference_text=tts_reference_text,
             tts_max_new_tokens=tts_max_new_tokens,
+            tts_deadline=tts_deadline,
         )
         result.stages["audio"] = audio_result
         result.status = "ok" if audio_result.status == "ok" else "failed"
@@ -1338,6 +1544,7 @@ def process_markdown_audio(
     tts_reference_audio: str | None = None,
     tts_reference_text: str | None = None,
     tts_max_new_tokens: int | None = None,
+    tts_deadline: float | None = None,
 ) -> StageResult:
     title = markdown_path.stem
     audio_path = AUDIO_DIR / f"{title}.{audio_format}"
@@ -1355,6 +1562,7 @@ def process_markdown_audio(
         tts_reference_audio=tts_reference_audio,
         tts_reference_text=tts_reference_text,
         tts_max_new_tokens=tts_max_new_tokens,
+        tts_deadline=tts_deadline,
     )
 
 
@@ -1603,6 +1811,12 @@ def parse_args() -> argparse.Namespace:
         help=f"LLM agent for text cleaning. Default: {DEFAULT_AGENT}",
     )
     parser.add_argument(
+        "--fallback-agent",
+        choices=AGENT_CHOICES,
+        default=None,
+        help="Fallback LLM agent for chunks rejected by the primary agent (e.g. high-risk content).",
+    )
+    parser.add_argument(
         "--tts-engine",
         choices=TTS_ENGINE_CHOICES,
         default=DEFAULT_TTS_ENGINE,
@@ -1619,6 +1833,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_TTS_MAX_NEW_TOKENS,
         help=f"Maximum tokens per TTS chunk. Default: {DEFAULT_TTS_MAX_NEW_TOKENS}",
+    )
+    parser.add_argument(
+        "--tts-max-runtime-hours",
+        type=float,
+        default=DEFAULT_TTS_MAX_RUNTIME_HOURS,
+        help=(
+            "Stop TTS after this many hours, release the worker, and keep completed parts for resume. "
+            f"Default: {DEFAULT_TTS_MAX_RUNTIME_HOURS}"
+        ),
     )
     parser.add_argument(
         "--audio-format",
@@ -1638,6 +1861,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     ensure_directories()
+
+    if args.tts_max_runtime_hours <= 0:
+        print("--tts-max-runtime-hours must be greater than 0", file=sys.stderr)
+        return 2
 
     if args.check_tools:
         return print_tool_status(args.ocr_engine, args.agent, args.audio or args.audio_only, args.tts_conda_env)
@@ -1703,6 +1930,7 @@ def main() -> int:
             "tts_conda_env": args.tts_conda_env,
             "tts_model": args.tts_model,
             "tts_chunk_chars": args.tts_chunk_chars,
+            "tts_max_runtime_hours": args.tts_max_runtime_hours,
             "tts_voice": tts_voice_profile.voice_id if tts_voice_profile else None,
             "tts_reference_audio": tts_reference_audio,
             "inputs": [str(path) for path in markdown_inputs],
@@ -1712,6 +1940,8 @@ def main() -> int:
         }
 
         successful_audio: set[Path] = set()
+        runtime_paused = False
+        tts_deadline = time.monotonic() + args.tts_max_runtime_hours * 3600
         try:
             with TTSWorkerClient(conda_env=args.tts_conda_env, model=args.tts_model) as tts_worker:
                 for markdown_path in markdown_inputs:
@@ -1727,10 +1957,13 @@ def main() -> int:
                         tts_reference_audio=tts_reference_audio,
                         tts_reference_text=tts_reference_text,
                         tts_max_new_tokens=args.tts_max_new_tokens,
+                        tts_deadline=tts_deadline,
                     )
                     result_record = {"input": str(markdown_path), "stage": audio_result.to_dict()}
                     if audio_result.status != "ok":
                         had_failure = True
+                        if audio_result.status == "paused":
+                            runtime_paused = True
                     else:
                         if audio_result.output:
                             successful_audio.add(Path(audio_result.output))
@@ -1747,13 +1980,16 @@ def main() -> int:
                     if archive_detail:
                         print(f"  - archive_input: ok {archive_detail['output']}")
                     audio_summary["results"].append(result_record)
+                    if runtime_paused:
+                        break
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return 1
 
-        archived_audio = archive_stale_audio(successful_audio)
+        archived_audio = [] if runtime_paused else archive_stale_audio(successful_audio)
         audio_summary["batch_audio_outputs"] = [str(path) for path in sorted(successful_audio)]
         audio_summary["archived_audio"] = archived_audio
+        audio_summary["runtime_paused"] = runtime_paused
         audio_summary["finished_at"] = datetime.now().isoformat(timespec="seconds")
         summary_path = AUDIO_LOG_DIR / f"{run_id}.json"
         summary_path.write_text(json.dumps(audio_summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1781,10 +2017,12 @@ def main() -> int:
         "keep_md": args.keep_md,
         "md_only": args.md_only,
         "llm_agent": args.agent,
+        "fallback_agent": args.fallback_agent,
         "generate_audio": args.audio,
         "tts_engine": args.tts_engine if args.audio else None,
         "tts_voice": tts_voice_profile.voice_id if args.audio and tts_voice_profile else None,
         "tts_reference_audio": tts_reference_audio if args.audio else None,
+        "tts_max_runtime_hours": args.tts_max_runtime_hours if args.audio else None,
         "inputs": [str(p) for p in inputs],
         "retention_mode": "batch_latest",
         "books": [],
@@ -1793,6 +2031,8 @@ def main() -> int:
     had_failure = False
     successful_epubs: set[Path] = set()
     successful_audio: set[Path] = set()
+    runtime_paused = False
+    tts_deadline = time.monotonic() + args.tts_max_runtime_hours * 3600 if args.audio else None
     try:
         tts_context = TTSWorkerClient(conda_env=args.tts_conda_env, model=args.tts_model) if args.audio else nullcontext(None)
         with tts_context as tts_worker:
@@ -1803,6 +2043,7 @@ def main() -> int:
                     args.skip_ocr,
                     args.ocr_engine,
                     args.agent,
+                    args.fallback_agent,
                     args.keep_md,
                     args.md_only,
                     args.audio,
@@ -1816,10 +2057,14 @@ def main() -> int:
                     tts_reference_audio,
                     tts_reference_text,
                     args.tts_max_new_tokens,
+                    tts_deadline,
                 )
                 summary["books"].append(book_result.to_dict())
                 if book_result.status != "ok":
                     had_failure = True
+                    audio_stage = (book_result.stages or {}).get("audio")
+                    if audio_stage and audio_stage.status == "paused":
+                        runtime_paused = True
                 else:
                     epub_stage = (book_result.stages or {}).get("epub")
                     if epub_stage and epub_stage.output:
@@ -1833,16 +2078,19 @@ def main() -> int:
                 for stage_name, stage in (book_result.stages or {}).items():
                     detail = stage.output or stage.error or ""
                     print(f"  - {stage_name}: {stage.status} {detail}".rstrip())
+                if runtime_paused:
+                    break
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
     archived_epubs = [] if args.md_only else archive_stale_epubs(successful_epubs)
-    archived_audio = archive_stale_audio(successful_audio) if args.audio else []
+    archived_audio = archive_stale_audio(successful_audio) if args.audio and not runtime_paused else []
     summary["batch_epub_outputs"] = [str(path) for path in sorted(successful_epubs)]
     summary["archived_epubs"] = archived_epubs
     summary["batch_audio_outputs"] = [str(path) for path in sorted(successful_audio)]
     summary["archived_audio"] = archived_audio
+    summary["runtime_paused"] = runtime_paused
 
     summary["finished_at"] = datetime.now().isoformat(timespec="seconds")
     summary_path = LOG_DIR / f"{run_id}.json"

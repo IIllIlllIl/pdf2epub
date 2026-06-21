@@ -7,7 +7,7 @@ Convert scanned Chinese magazine PDFs into mobile-friendly EPUB files, cleaned M
 ## Architecture
 
 - **OCR**: `ocrmypdf + tesseract` using the `tesseract` OCR backend.
-- **Text cleanup**: Codex CLI by default, or Claude CLI with `--agent claude`.
+- **Text cleanup**: Claude CLI by default, or Codex CLI with `--agent codex`.
 - **EPUB generation**: `pandoc`.
 - **Audio generation**: `fish-mlx`, loaded once through a persistent `mlx-speech` worker in a separate `tts-mlx` conda environment.
 - **Runtime**: local conda by default, Docker optionally.
@@ -45,10 +45,10 @@ pdf2epub/
 ```bash
 conda create -y -n pdf2epub python=3.11 pandoc tesseract ocrmypdf -c conda-forge
 conda run -n pdf2epub python -m pip install fpdf2 pi-heif
-npm install -g @openai/codex
+npm install -g @anthropic-ai/claude-code
 ```
 
-Install Claude CLI separately if you want `--agent claude`.
+Install Codex CLI separately if you want `--agent codex`: `npm install -g @openai/codex`.
 
 For Markdown-to-audio generation, create a separate MLX Speech environment:
 
@@ -66,15 +66,15 @@ docker build -f src/Dockerfile -t pdf2epub .
 
 ### 2. Authenticate LLM CLI
 
-Codex CLI is the default cleanup agent. Make sure either:
+Claude CLI is the default cleanup agent. Make sure one of:
+
+- `ANTHROPIC_API_KEY` is set, or
+- `ANTHROPIC_AUTH_TOKEN` is set.
+
+For Codex CLI, use `--agent codex` and make sure either:
 
 - `codex login` has been completed locally, or
 - `OPENAI_API_KEY` is set.
-
-For Claude CLI, use `--agent claude` and set one of:
-
-- `ANTHROPIC_AUTH_TOKEN`
-- `ANTHROPIC_API_KEY`
 
 ### 3. Check Tools
 
@@ -82,7 +82,7 @@ For Claude CLI, use `--agent claude` and set one of:
 conda run -n pdf2epub python src/pdf2epub.py --check-tools
 ```
 
-Expected tools include `codex`, `ocrmypdf`, `tesseract`, and `pandoc`.
+Expected tools include `claude`, `ocrmypdf`, `tesseract`, and `pandoc`.
 
 ### 4. Common Commands
 
@@ -102,8 +102,8 @@ conda run -n pdf2epub python src/pdf2epub.py --all --skip-ocr
 # Switch OCR language. Default is Simplified Chinese + English.
 conda run -n pdf2epub python src/pdf2epub.py --all --lang chi_sim+eng
 
-# Use Claude instead of Codex.
-conda run -n pdf2epub python src/pdf2epub.py --all --agent claude
+# Use Codex instead of Claude.
+conda run -n pdf2epub python src/pdf2epub.py --all --agent codex
 
 # Generate audio after PDF -> EPUB succeeds.
 conda run -n pdf2epub python src/pdf2epub.py --input input/example.pdf --audio
@@ -134,7 +134,7 @@ conda run -n pdf2epub python src/pdf2epub.py --import-fish-voice 0f08cacd3e35447
 | `--keep-md` / `--no-keep-md` | Keep intermediate Markdown. Default: keep. |
 | `--lang <lang>` | Tesseract OCR language. Default: `chi_sim+eng`. Use `eng` for English, `chi_tra+eng` for Traditional Chinese if installed. |
 | `--ocr-engine <tesseract>` | OCR backend. Currently only `tesseract`. |
-| `--agent <codex\|claude>` | LLM cleanup agent. Default: `codex`. |
+| `--agent <codex\|claude>` | LLM cleanup agent. Default: `claude`. |
 | `--tts-engine <fish-mlx>` | TTS engine. Currently only `fish-mlx`. |
 | `--tts-conda-env <env>` | TTS conda environment. Default: `tts-mlx`. |
 | `--tts-model <model>` | `mlx-speech` model name. Default: `fish-s2-pro`. |
@@ -143,6 +143,7 @@ conda run -n pdf2epub python src/pdf2epub.py --import-fish-voice 0f08cacd3e35447
 | `--tts-reference-audio <wav>` | One-off reference audio for Fish S2 Pro cloning. |
 | `--tts-reference-text <text>` | Transcript for `--tts-reference-audio`. Must be provided together. |
 | `--tts-max-new-tokens <n>` | Max generated tokens per TTS chunk. Default: `512`. |
+| `--tts-max-runtime-hours <hours>` | Maximum TTS batch runtime. Default: `5` hours. On expiry, stop the worker, release resources, and keep completed parts so the same command can resume. |
 | `--audio-format <wav>` | Audio format. Currently only `wav`. |
 | `--keep-audio-parts` | Keep per-chunk WAV files after merging. |
 | `--list-voices` | List local voices under `voices/`. |
@@ -154,10 +155,10 @@ conda run -n pdf2epub python src/pdf2epub.py --import-fish-voice 0f08cacd3e35447
 ## Processing Flow
 
 1. **OCR**: `ocrmypdf` runs Tesseract and writes an OCR PDF plus sidecar text. If `unpaper` exists, OCR cleanup is enabled; otherwise cleanup is skipped to avoid hard failure.
-2. **LLM cleanup**: sidecar text is grouped by pages and cleaned by the selected CLI agent into Markdown.
+2. **LLM cleanup**: sidecar text is grouped by pages and cleaned by the selected CLI agent into Markdown. Default: `claude -p --output-format json`; with `--agent codex` uses `codex exec`.
 3. **Markdown-only**: with `--md-only`, stop here and keep the input PDF in place.
 4. **EPUB**: `pandoc` converts Markdown into EPUB.
-5. **Audio**: `--audio` or `--audio-only` starts one persistent TTS worker and reuses the loaded Fish S2 Pro model across chunks/files. If a same-name WAV already exists, it is archived to `output/archived_audio/` before the new WAV is placed in `output/audio/`.
+5. **Audio**: `--audio` or `--audio-only` starts one persistent TTS worker and reuses the loaded Fish S2 Pro model across chunks/files. The default runtime limit is 5 hours; on expiry the worker stops and completed parts remain available for a validated resume with the same command. If a same-name WAV already exists, it is archived to `output/archived_audio/` before the new WAV is placed in `output/audio/`.
 6. **Archive stale EPUBs**: `output/epub/` keeps only the latest successful batch; older EPUBs move to `output/archived_epub/`.
 7. **Archive stale WAVs**: audio runs keep only the latest successful batch in `output/audio/`; older WAVs move to `output/archived_audio/`.
 8. **Archive inputs**: successful full PDF runs move processed PDFs to `input/archived_pdf/`. Successful `--audio-only` runs also archive a same-stem PDF if it exists in `input/`.

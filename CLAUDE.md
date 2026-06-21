@@ -5,7 +5,7 @@
 ## 技术方案
 
 - OCR: `ocrmypdf + tesseract`（当前唯一实现的 OCR engine，参数名为 `tesseract`；`unpaper` 存在时才启用 OCR 清理）
-- 清洗: **codex 命令默认 / claude 命令可选 (LLM)**
+- 清洗: **claude 命令默认 / codex 命令可选 (LLM)**
 - EPUB: `pandoc`
 - 音频: `fish-mlx`（独立 `tts-mlx` conda 环境中的常驻 `mlx-speech` worker）
 
@@ -29,7 +29,7 @@ conda run -n pdf2epub python src/pdf2epub.py --all
 conda run -n pdf2epub python src/pdf2epub.py --all --md-only
 conda run -n pdf2epub python src/pdf2epub.py --all --skip-ocr
 conda run -n pdf2epub python src/pdf2epub.py --all --ocr-engine tesseract
-conda run -n pdf2epub python src/pdf2epub.py --all --agent claude
+conda run -n pdf2epub python src/pdf2epub.py --all --agent codex
 conda run -n pdf2epub python src/pdf2epub.py --all --no-keep-md
 conda run -n pdf2epub python src/pdf2epub.py --audio-only --md-input output/clean_md/example.md
 conda run -n pdf2epub python src/pdf2epub.py --list-voices
@@ -47,7 +47,7 @@ conda run -n pdf2epub python src/pdf2epub.py --import-fish-voice 0f08cacd3e35447
 - 优化 `src/clean_prompt.md` 中的清洗指令
 - 用 `--skip-ocr` 复用 `output/sidecar_txt/*.txt` 做快速迭代
 - 检查 `output/logs/run/*.json` 中的 token 消耗
-- 默认 LLM agent 是 `codex`；需要回退 Claude CLI 时使用 `--agent claude`
+- 默认 LLM agent 是 `claude`；需要回退 Codex CLI 时使用 `--agent codex`
 - 默认 OCR engine 是 `tesseract`；当前实现通过 `ocrmypdf` 调用 Tesseract
 - 默认保留 `output/clean_md/*.md`；只有传入 `--no-keep-md` 才在成功后删除
 - 用 `--md-only` 可只生成 `output/clean_md/*.md`，不生成 EPUB/音频，也不归档输入 PDF

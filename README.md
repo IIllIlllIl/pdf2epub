@@ -7,7 +7,7 @@
 ## 技术方案
 
 - **OCR**: `ocrmypdf + tesseract`（当前唯一实现的 OCR engine，参数名为 `tesseract`）
-- **文本清洗**: `codex` 命令（默认）或 `claude` 命令（LLM 智能清洗）
+- **文本清洗**: `claude` 命令（默认）或 `codex` 命令（LLM 智能清洗）
 - **EPUB 生成**: `pandoc`
 - **音频生成**: `fish-mlx`（通过独立 `tts-mlx` conda 环境启动常驻 `mlx-speech` worker）
 - **运行环境**: 本地 conda 环境（默认）/ Docker（可选）
@@ -49,10 +49,10 @@ pdf2epub/
 ```bash
 conda create -y -n pdf2epub python=3.11 pandoc tesseract ocrmypdf -c conda-forge
 conda run -n pdf2epub python -m pip install fpdf2 pi-heif
-npm install -g @openai/codex
+npm install -g @anthropic-ai/claude-code
 ```
 
-如果需要使用 `--agent claude`，请另外安装 Claude CLI。
+如果需要使用 `--agent codex`，请另外安装 Codex CLI：`npm install -g @openai/codex`。
 
 如果需要从 Markdown 生成音频，另建独立 TTS 环境：
 
@@ -70,13 +70,13 @@ docker build -f src/Dockerfile -t pdf2epub .
 
 ### 2. 准备 LLM CLI 认证
 
-默认使用 Codex CLI。请确保当前运行环境能访问 Codex CLI 认证。常见做法：
+默认使用 Claude CLI。请确保当前运行环境能访问 Claude CLI 认证。常见做法：
+- 设置 `ANTHROPIC_API_KEY`；或
+- 设置 `ANTHROPIC_AUTH_TOKEN`
+
+如果需要继续使用 Codex CLI，可运行时传入 `--agent codex`，并确保满足以下至少一种 Codex CLI 认证方式：
 - 已通过 `codex login` 登录；或
 - 设置 `OPENAI_API_KEY`
-
-如果需要继续使用 Claude CLI，可运行时传入 `--agent claude`，并确保满足以下至少一种 Claude CLI 认证方式：
-- 设置 `ANTHROPIC_AUTH_TOKEN`；或
-- 设置 `ANTHROPIC_API_KEY`
 
 如果使用 Docker，`run.sh` 会传递常见认证环境变量，但不会挂载宿主机 `$HOME/.codex` 或 `$HOME/.claude`，以保持容器内 CLI 运行环境独立。
 
@@ -90,7 +90,7 @@ conda run -n pdf2epub python src/pdf2epub.py --check-tools
 docker run --rm -v "$PWD":/workspace pdf2epub --check-tools
 ```
 
-预期输出应包含：`codex`、`ocrmypdf`、`tesseract`、`pandoc`。如果使用 `--agent claude`，则应包含 `claude`。
+预期输出应包含：`claude`、`ocrmypdf`、`tesseract`、`pandoc`。如果使用 `--agent codex`，则应包含 `codex`。
 
 ### 4. 处理 PDF
 
@@ -110,8 +110,8 @@ conda run -n pdf2epub python src/pdf2epub.py --all --ocr-engine tesseract
 # conda：切换 OCR 语言；中文简体+英文为默认值
 conda run -n pdf2epub python src/pdf2epub.py --all --lang chi_sim+eng
 
-# conda：指定使用 Claude CLI
-conda run -n pdf2epub python src/pdf2epub.py --all --agent claude
+# conda：恢复使用 Codex CLI
+conda run -n pdf2epub python src/pdf2epub.py --all --agent codex
 
 # conda：复用已有 sidecar，仅重跑清洗与 EPUB
 conda run -n pdf2epub python src/pdf2epub.py --all --skip-ocr
@@ -154,7 +154,7 @@ conda run -n pdf2epub python src/pdf2epub.py --import-fish-voice 0f08cacd3e35447
 | `--keep-md` / `--no-keep-md` | 是否保留中间 Markdown，默认保留；使用 `--no-keep-md` 可在成功后删除 |
 | `--lang <lang>` | OCR 语言，默认 `chi_sim+eng`；例如英文可用 `eng`，繁体中文可用 `chi_tra+eng`，取决于本机 Tesseract 语言包 |
 | `--ocr-engine <tesseract>` | OCR engine，默认 `tesseract`；当前通过 `ocrmypdf` 调用 Tesseract |
-| `--agent <codex\|claude>` | LLM 清洗 agent，默认 `codex` |
+| `--agent <codex\|claude>` | LLM 清洗 agent，默认 `claude` |
 | `--tts-engine <fish-mlx>` | TTS engine，默认 `fish-mlx` |
 | `--tts-conda-env <env>` | TTS conda 环境，默认 `tts-mlx` |
 | `--tts-model <model>` | `mlx-speech` 模型名，默认 `fish-s2-pro` |
@@ -163,6 +163,7 @@ conda run -n pdf2epub python src/pdf2epub.py --import-fish-voice 0f08cacd3e35447
 | `--tts-reference-audio <wav>` | Fish S2 Pro 音色克隆参考音频 |
 | `--tts-reference-text <text>` | 参考音频对应文本，需与 `--tts-reference-audio` 同时提供 |
 | `--tts-max-new-tokens <n>` | 每个 TTS 分段的最大生成 token 数，默认 `512` |
+| `--tts-max-runtime-hours <hours>` | 单次 TTS 批次最长运行时间，默认 `5` 小时；到期后停止 worker、释放资源并保留分片，重新运行相同命令可断点续跑 |
 | `--audio-format <wav>` | 音频格式，当前支持 `wav` |
 | `--keep-audio-parts` | 保留每段生成的分片 wav；默认合并后清理分片 |
 | `--list-voices` | 列出 `voices/` 下的本地候选说话人 |
@@ -174,10 +175,10 @@ conda run -n pdf2epub python src/pdf2epub.py --import-fish-voice 0f08cacd3e35447
 ## 处理流程
 
 1. **OCR**: 按 `--ocr-engine` 选择 OCR backend；当前 `tesseract` backend 通过 `ocrmypdf` 调用 Tesseract，生成可搜索 PDF 和 sidecar 文本；若系统存在 `unpaper` 则启用 `--clean`，否则自动跳过清理以避免 OCR 中断
-2. **LLM 清洗**: 按分页分组调用所选 agent 清洗文本并合并为 Markdown；默认调用 `codex exec`，传入 `--agent claude` 时调用 `claude -p --output-format json`
+2. **LLM 清洗**: 按分页分组调用所选 agent 清洗文本并合并为 Markdown；默认调用 `claude -p --output-format json`，传入 `--agent codex` 时调用 `codex exec`
 3. **Markdown-only（可选）**: 传入 `--md-only` 时到此停止，保留输入 PDF 和中间 Markdown，不生成 EPUB/音频，也不归档旧 EPUB
 4. **EPUB**: Markdown 转 EPUB，输出到 `output/epub/`
-5. **音频生成（可选）**: `--audio` 或 `--audio-only` 会启动一个常驻 TTS worker，加载一次 `fish-s2-pro`，再把 Markdown 规整、分段，逐段生成 wav，最后合并为 `output/audio/*.wav`；若同名 wav 已存在，旧文件会先归档到 `output/archived_audio/`
+5. **音频生成（可选）**: `--audio` 或 `--audio-only` 会启动一个常驻 TTS worker，加载一次 `fish-s2-pro`，再把 Markdown 规整、分段，逐段生成 wav，最后合并为 `output/audio/*.wav`；默认运行上限为 5 小时，到期后关闭 worker 并保留已完成分片，重新运行相同命令会校验并续跑；若同名 wav 已存在，旧文件会先归档到 `output/archived_audio/`
 6. **批次归档旧 EPUB**: 本次运行结束后，`output/epub/` 中所有不属于本批次成功结果的 EPUB 都会移到 `output/archived_epub/`
 7. **批次归档旧 WAV**: 生成音频的运行结束后，`output/audio/` 中所有不属于本批次成功结果的 wav 都会移到 `output/archived_audio/`
 8. **成功清理/归档**: 成功后自动删除 `output/ocr_pdf/*.ocr.pdf`，默认保留 `output/clean_md/*.md`；传入 `--no-keep-md` 时也会删除中间 Markdown，并把已处理输入 PDF 移到 `input/archived_pdf/`
@@ -195,19 +196,19 @@ conda run -n pdf2epub python src/pdf2epub.py --import-fish-voice 0f08cacd3e35447
 
 ## 运行要求
 
-当前默认使用 Codex CLI。运行环境需满足以下至少一种 Codex CLI 认证方式：
+当前默认使用 Claude CLI。运行环境需满足以下至少一种 Claude CLI 认证方式：
+
+| 方式 | 说明 |
+|------|------|
+| `ANTHROPIC_API_KEY` | 走 API key |
+| `ANTHROPIC_AUTH_TOKEN` | 走 bearer token |
+
+使用 `--agent codex` 时，运行环境需满足以下至少一种 Codex CLI 认证方式：
 
 | 方式 | 说明 |
 |------|------|
 | `codex login` | 使用本机 Codex 登录状态 |
 | `OPENAI_API_KEY` | 走 API key |
-
-使用 `--agent claude` 时，运行环境需满足以下至少一种 Claude CLI 认证方式：
-
-| 方式 | 说明 |
-|------|------|
-| `ANTHROPIC_AUTH_TOKEN` | 走 bearer token |
-| `ANTHROPIC_API_KEY` | 走 API key |
 
 Fish S2 Pro MLX 当前不提供固定说话人列表。默认使用模型自身音色；如需指定音色，优先把候选放入 `voices/<voice_id>/` 并使用 `--tts-voice`。也可以直接使用 `--tts-reference-audio` 和 `--tts-reference-text` 做一次性参考音频克隆。
 
