@@ -560,16 +560,73 @@ def load_prompt_template() -> str:
     return PROMPT_PATH.read_text(encoding="utf-8")
 
 
+TTS_DIGIT_NAMES = {
+    "0": "零",
+    "1": "一",
+    "2": "二",
+    "3": "三",
+    "4": "四",
+    "5": "五",
+    "6": "六",
+    "7": "七",
+    "8": "八",
+    "9": "九",
+}
+
+
+def number_under_100_to_chinese(value: int) -> str:
+    if value < 0 or value >= 100:
+        return "".join(TTS_DIGIT_NAMES[digit] for digit in str(value))
+    if value < 10:
+        return TTS_DIGIT_NAMES[str(value)]
+    tens, ones = divmod(value, 10)
+    prefix = "十" if tens == 1 else f"{TTS_DIGIT_NAMES[str(tens)]}十"
+    return prefix if ones == 0 else f"{prefix}{TTS_DIGIT_NAMES[str(ones)]}"
+
+
+def digits_to_spoken_chinese(digits: str) -> str:
+    return "、".join(TTS_DIGIT_NAMES[digit] for digit in digits)
+
+
+def add_tts_number_prosody(text: str) -> str:
+    def replace_date(match: re.Match[str]) -> str:
+        year, month, day = match.group(1), int(match.group(2)), int(match.group(3))
+        spoken_year = "".join(TTS_DIGIT_NAMES[digit] for digit in year)
+        return f"[emphasis]{spoken_year}年{number_under_100_to_chinese(month)}月{number_under_100_to_chinese(day)}日"
+
+    text = re.sub(r"(?<!\d)(\d{4})年(\d{1,2})月(\d{1,2})日", replace_date, text)
+
+    def replace_digits(match: re.Match[str]) -> str:
+        digits = match.group(0)
+        if len(digits) >= 4:
+            return f"[emphasis]{digits_to_spoken_chinese(digits)}"
+        return f"[emphasis]{digits}"
+
+    return re.sub(r"(?<![\d./-])\d{2,}(?![\d./-])", replace_digits, text)
+
+
 def normalize_markdown_for_tts(markdown: str) -> str:
     text = re.sub(r"```.*?```", "\n", markdown, flags=re.DOTALL)
     text = re.sub(r"!\[[^\]]*]\([^)]*\)", "", text)
     text = re.sub(r"\[([^\]]+)]\([^)]*\)", r"\1", text)
-    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(
+        r"^\s{0,3}#{1,6}\s*(.+?)\s*#*\s*$",
+        lambda match: f"\n[pause]\n{match.group(1).strip()}\n[short pause]\n",
+        text,
+        flags=re.MULTILINE,
+    )
     text = re.sub(r"^\s{0,3}[-*+]\s+", "", text, flags=re.MULTILINE)
     text = re.sub(r"^\s{0,3}\d+[.)]\s+", "", text, flags=re.MULTILINE)
     text = re.sub(r"[*_`>|~]", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n", text) if paragraph.strip()]
+    paced_paragraphs: list[str] = []
+    for paragraph in paragraphs:
+        if paced_paragraphs and not paced_paragraphs[-1].endswith("[short pause]"):
+            paced_paragraphs.append("[short pause]")
+        paced_paragraphs.append(paragraph)
+    text = "\n\n".join(paced_paragraphs)
+    return add_tts_number_prosody(text).strip()
 
 
 def split_text_for_tts(text: str, max_chars: int) -> list[str]:
