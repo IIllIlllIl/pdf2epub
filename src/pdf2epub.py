@@ -726,7 +726,8 @@ def split_text_for_tts(text: str, max_chars: int) -> list[str]:
     current = ""
 
     def normalize_tts_chunk(chunk: str) -> str:
-        return re.sub(r"([。！？!?；;])\n+([”’」』）】》])", r"\1\2", chunk.strip())
+        normalized = re.sub(r"([。！？!?；;])\n+([”’」』）】》])", r"\1\2", chunk.strip())
+        return re.sub(r"(?:\s*\[(?:short pause|pause)]\s*)+$", "", normalized).strip()
 
     def choose_split_index(sentence: str) -> int:
         window = sentence[:max_chars]
