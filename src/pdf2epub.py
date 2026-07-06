@@ -29,6 +29,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+try:
+    from tts_preprocess import normalize_markdown_for_tts, preflight_tts_chunks, split_text_for_tts
+except ModuleNotFoundError:  # Allows importing as src.pdf2epub from the repo root.
+    from src.tts_preprocess import normalize_markdown_for_tts, preflight_tts_chunks, split_text_for_tts
+
 # Paths
 ROOT = Path(__file__).resolve().parent.parent
 INPUT_DIR = ROOT / "input"
@@ -560,216 +565,6 @@ def load_prompt_template() -> str:
     return PROMPT_PATH.read_text(encoding="utf-8")
 
 
-TTS_DIGIT_NAMES = {
-    "0": "零",
-    "1": "一",
-    "2": "二",
-    "3": "三",
-    "4": "四",
-    "5": "五",
-    "6": "六",
-    "7": "七",
-    "8": "八",
-    "9": "九",
-}
-
-
-def number_under_100_to_chinese(value: int) -> str:
-    if value < 0 or value >= 100:
-        return "".join(TTS_DIGIT_NAMES[digit] for digit in str(value))
-    if value < 10:
-        return TTS_DIGIT_NAMES[str(value)]
-    tens, ones = divmod(value, 10)
-    prefix = "十" if tens == 1 else f"{TTS_DIGIT_NAMES[str(tens)]}十"
-    return prefix if ones == 0 else f"{prefix}{TTS_DIGIT_NAMES[str(ones)]}"
-
-
-def digits_to_spoken_chinese(digits: str) -> str:
-    return "、".join(TTS_DIGIT_NAMES[digit] for digit in digits)
-
-
-def integer_to_chinese(value: int) -> str:
-    if value < 100:
-        return number_under_100_to_chinese(value)
-    if value >= 10000:
-        return digits_to_spoken_chinese(str(value))
-
-    units = ["", "十", "百", "千"]
-    digits = [int(digit) for digit in str(value)]
-    parts: list[str] = []
-    pending_zero = False
-    length = len(digits)
-    for offset, digit in enumerate(digits):
-        unit_index = length - offset - 1
-        if digit == 0:
-            pending_zero = bool(parts)
-            continue
-        if pending_zero:
-            parts.append("零")
-            pending_zero = False
-        parts.append(f"{TTS_DIGIT_NAMES[str(digit)]}{units[unit_index]}")
-    return "".join(parts) or "零"
-
-
-def decimal_to_chinese(value: str) -> str:
-    integer, dot, fraction = value.partition(".")
-    spoken = integer_to_chinese(int(integer))
-    if dot:
-        spoken += "点" + "".join(TTS_DIGIT_NAMES[digit] for digit in fraction)
-    return spoken
-
-
-def sanitize_tts_input_text(text: str) -> str:
-    cjk = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = text.replace("\u00a0", " ").replace("\u3000", " ")
-    text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"([。！？!?；;，,])\s*\n\s*([”’」』）】》])", r"\1\2", text)
-    previous = None
-    while previous != text:
-        previous = text
-        text = re.sub(fr"([{cjk}])\s+([{cjk}])", r"\1\2", text)
-    text = re.sub(r"\s+([，。！？；：、）】》”’」』])", r"\1", text)
-    text = re.sub(r"([（【《“‘「『])\s+", r"\1", text)
-
-    cleaned_lines: list[str] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped and re.fullmatch(r"[^\w\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\[\]]+", stripped):
-            continue
-        cleaned_lines.append(stripped if stripped else "")
-
-    text = "\n".join(cleaned_lines)
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
-
-
-def add_tts_number_prosody(text: str) -> str:
-    def replace_date(match: re.Match[str]) -> str:
-        year, month, day = match.group(1), int(match.group(2)), int(match.group(3))
-        spoken_year = "".join(TTS_DIGIT_NAMES[digit] for digit in year)
-        return f"{spoken_year}年{number_under_100_to_chinese(month)}月{number_under_100_to_chinese(day)}日"
-
-    text = re.sub(r"(?<!\d)(\d{4})年(\d{1,2})月(\d{1,2})日", replace_date, text)
-
-    text = re.sub(
-        r"(?<!\d)(\d{4})年",
-        lambda match: f"{''.join(TTS_DIGIT_NAMES[digit] for digit in match.group(1))}年",
-        text,
-    )
-    text = re.sub(
-        r"(?<![\d.])(\d+(?:\.\d+)?)个百分点",
-        lambda match: f"[emphasis]{decimal_to_chinese(match.group(1))}个百分点[short pause]",
-        text,
-    )
-    text = re.sub(
-        r"(?<![\d.])(\d+(?:\.\d+)?)%",
-        lambda match: f"[emphasis]百分之{decimal_to_chinese(match.group(1))}[short pause]",
-        text,
-    )
-    text = re.sub(
-        r"(?<![\d.])(\d+(?:\.\d+)?)倍",
-        lambda match: f"[emphasis]{decimal_to_chinese(match.group(1))}倍[short pause]",
-        text,
-    )
-    text = re.sub(
-        r"(?<![\d.])(\d+(?:\.\d+)?)(万|亿)?元",
-        lambda match: f"[emphasis]{decimal_to_chinese(match.group(1))}{match.group(2) or ''}元[short pause]",
-        text,
-    )
-    text = re.sub(
-        r"第(\d{1,3})(期|章|节|名|位)",
-        lambda match: f"第{integer_to_chinese(int(match.group(1)))}{match.group(2)}",
-        text,
-    )
-    text = re.sub(
-        r"(?<![\d.])(\d{1,4})(座|家|人|项|个)",
-        lambda match: f"[emphasis]{integer_to_chinese(int(match.group(1)))}{match.group(2)}",
-        text,
-    )
-    return re.sub(
-        r"(?<![\d./-])\d{4,}(?![\d./-])",
-        lambda match: digits_to_spoken_chinese(match.group(0)),
-        text,
-    )
-
-
-def normalize_markdown_for_tts(markdown: str) -> str:
-    text = re.sub(r"```.*?```", "\n", markdown, flags=re.DOTALL)
-    text = re.sub(r"!\[[^\]]*]\([^)]*\)", "", text)
-    text = re.sub(r"\[([^\]]+)]\([^)]*\)", r"\1", text)
-    text = re.sub(
-        r"^\s{0,3}#{1,6}\s*(.+?)\s*#*\s*$",
-        lambda match: f"\n[pause]\n{match.group(1).strip()}\n[short pause]\n",
-        text,
-        flags=re.MULTILINE,
-    )
-    text = re.sub(r"^\s{0,3}[-*+]\s+", "", text, flags=re.MULTILINE)
-    text = re.sub(r"^\s{0,3}\d+[.)]\s+", "", text, flags=re.MULTILINE)
-    text = re.sub(r"[*_`>|~]", "", text)
-    text = sanitize_tts_input_text(text)
-    paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n", text) if paragraph.strip()]
-    paced_paragraphs: list[str] = []
-    for paragraph in paragraphs:
-        if paced_paragraphs and not paced_paragraphs[-1].endswith("[short pause]"):
-            paced_paragraphs.append("[short pause]")
-        paced_paragraphs.append(paragraph)
-    text = "\n\n".join(paced_paragraphs)
-    return add_tts_number_prosody(text).strip()
-
-
-def split_text_for_tts(text: str, max_chars: int) -> list[str]:
-    if max_chars < 100:
-        raise ValueError("--tts-chunk-chars must be at least 100")
-
-    chunks: list[str] = []
-    current = ""
-
-    def normalize_tts_chunk(chunk: str) -> str:
-        normalized = re.sub(r"([。！？!?；;])\n+([”’」』）】》])", r"\1\2", chunk.strip())
-        return re.sub(r"(?:\s*\[(?:short pause|pause)]\s*)+$", "", normalized).strip()
-
-    def choose_split_index(sentence: str) -> int:
-        window = sentence[:max_chars]
-        minimum = max(40, max_chars // 2)
-        punctuation = "，,、：:；;。！？!?"
-        candidates = [window.rfind(mark) + 1 for mark in punctuation]
-        candidates = [index for index in candidates if index >= minimum]
-        return max(candidates) if candidates else max_chars
-
-    def flush_current() -> None:
-        nonlocal current
-        normalized = normalize_tts_chunk(current)
-        if normalized:
-            chunks.append(normalized)
-        current = ""
-
-    paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n", text) if paragraph.strip()]
-    for paragraph in paragraphs:
-        sentences = [item.strip() for item in re.split(r"(?<=[。！？!?；;])", paragraph) if item.strip()]
-        if not sentences:
-            sentences = [paragraph]
-
-        for sentence in sentences:
-            while len(sentence) > max_chars:
-                if current:
-                    flush_current()
-                split_index = choose_split_index(sentence)
-                chunks.append(normalize_tts_chunk(sentence[:split_index]))
-                sentence = sentence[split_index:].strip()
-
-            separator = "\n" if current else ""
-            if current and len(current) + len(separator) + len(sentence) > max_chars:
-                flush_current()
-            current = f"{current}{separator}{sentence}" if current else sentence
-
-        if current and len(current) + 1 <= max_chars:
-            current = f"{current}\n"
-
-    flush_current()
-    return chunks
-
-
 def extract_token_usage(result: dict) -> tuple[int, int]:
     usage = result.get("usage")
     if isinstance(usage, dict):
@@ -1279,6 +1074,16 @@ def stage_audio_fish_mlx(
 
     if not chunks:
         return StageResult(status="failed", error=f"audio: no speakable text in {markdown_path}")
+
+    preflight_issues = preflight_tts_chunks(chunks)
+    if preflight_issues:
+        preview = "; ".join(
+            f"{issue.kind}@{issue.index}: {issue.detail}"
+            for issue in preflight_issues[:5]
+        )
+        if len(preflight_issues) > 5:
+            preview += f"; ... {len(preflight_issues) - 5} more"
+        return StageResult(status="failed", error=f"audio: TTS preflight failed: {preview}")
 
     safe_title = "".join(char if char.isalnum() or char in "._-" else "_" for char in title).strip("_") or "audio"
     parts_dir = AUDIO_PARTS_DIR / safe_title

@@ -178,7 +178,7 @@ conda run -n pdf2epub python src/pdf2epub.py --import-fish-voice 0f08cacd3e35447
 2. **LLM 清洗**: 按分页分组调用所选 agent 清洗文本并合并为 Markdown；默认调用 `claude -p --output-format json`，传入 `--agent codex` 时调用 `codex exec`
 3. **Markdown-only（可选）**: 传入 `--md-only` 时到此停止，保留输入 PDF 和中间 Markdown，不生成 EPUB/音频，也不归档旧 EPUB
 4. **EPUB**: Markdown 转 EPUB，输出到 `output/epub/`
-5. **音频生成（可选）**: `--audio` 或 `--audio-only` 会启动一个常驻 TTS worker，加载一次 `fish-s2-pro`，再把 Markdown 做 TTS 专用规整（清理异常空白/孤立标点、为标题和段落加入停顿、改写数字读法）、分段，逐段生成 wav，最后合并为 `output/audio/*.wav`；默认运行上限为 5 小时，到期后关闭 worker 并保留已完成分片，重新运行相同命令会校验并续跑；若同名 wav 已存在，旧文件会先归档到 `output/archived_audio/`
+5. **音频生成（可选）**: `--audio` 或 `--audio-only` 会启动一个常驻 TTS worker，加载一次 `fish-s2-pro`，再把 Markdown 做 TTS 专用规整（清理异常空白/孤立标点、修复已知断句风险、为标题和段落加入停顿、改写数字读法）、分段，并在生成前执行 preflight 检查以拦截残留高风险 chunk；检查通过后逐段生成 wav，最后合并为 `output/audio/*.wav`；默认运行上限为 5 小时，到期后关闭 worker 并保留已完成分片，重新运行相同命令会校验并续跑；若同名 wav 已存在，旧文件会先归档到 `output/archived_audio/`
 6. **批次归档旧 EPUB**: 本次运行结束后，`output/epub/` 中所有不属于本批次成功结果的 EPUB 都会移到 `output/archived_epub/`
 7. **批次归档旧 WAV**: 生成音频的运行结束后，`output/audio/` 中所有不属于本批次成功结果的 wav 都会移到 `output/archived_audio/`
 8. **成功清理/归档**: 成功后自动删除 `output/ocr_pdf/*.ocr.pdf`，默认保留 `output/clean_md/*.md`；传入 `--no-keep-md` 时也会删除中间 Markdown，并把已处理输入 PDF 移到 `input/archived_pdf/`
