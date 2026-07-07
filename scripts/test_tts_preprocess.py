@@ -27,6 +27,8 @@ def test_known_instability_repairs() -> None:
 ## 资本与金融
 
 根据该组织公布的2023年-2026年周期预算，票价1700美元，养老金1700多元。
+事故发生时的车辆行驶速度约为112公里/小时。死者主要是55~70岁的女性。
+2025年改种和增加的蓝莓大棚面积约7000~10000亩。
 
 “这个跨度是很大的。
 ”他表示。
@@ -37,11 +39,15 @@ def test_known_instability_repairs() -> None:
 
     assert_contains(normalized, "分别在二零二五年九月开始。")
     assert_contains(normalized, "二零二三年至二零二六年周期预算")
-    assert_contains(normalized, "[emphasis]一千七百美元[short pause]")
-    assert_contains(normalized, "[emphasis]一千七百多元[short pause]")
+    assert_contains(normalized, "[emphasis]一千七百美元")
+    assert_contains(normalized, "[emphasis]一千七百多元")
+    assert_contains(normalized, "每小时一百一十二公里")
+    assert_contains(normalized, "五十五岁到七十岁")
+    assert_contains(normalized, "七千亩到一万亩")
     assert_contains(normalized, "“这个跨度是很大的。”他表示。")
     assert_contains(normalized, "国际购物中心协会市场调查。")
     assert_not_contains(normalized, "国 际")
+    assert_not_contains(normalized, "一、七、零、零")
 
     chunks = split_text_for_tts(normalized, 120)
     issues = preflight_tts_chunks(chunks)

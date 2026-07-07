@@ -49,7 +49,13 @@ def integer_to_chinese(value: int) -> str:
     if value < 100:
         return number_under_100_to_chinese(value)
     if value >= 10000:
-        return digits_to_spoken_chinese(str(value))
+        high, low = divmod(value, 10000)
+        high_spoken = integer_to_chinese(high)
+        if low == 0:
+            return f"{high_spoken}万"
+        if low < 1000:
+            return f"{high_spoken}万零{integer_to_chinese(low)}"
+        return f"{high_spoken}万{integer_to_chinese(low)}"
 
     units = ["", "十", "百", "千"]
     digits = [int(digit) for digit in str(value)]
@@ -99,7 +105,7 @@ def strip_markdown_for_tts(markdown: str) -> str:
     )
     text = re.sub(r"^\s{0,3}[-*+]\s+", "", text, flags=re.MULTILINE)
     text = re.sub(r"^\s{0,3}\d+[.)]\s+", "", text, flags=re.MULTILINE)
-    return re.sub(r"[*_`>|~]", "", text)
+    return re.sub(r"[*_`>|]", "", text)
 
 
 def sanitize_tts_input_text(text: str) -> str:
@@ -132,8 +138,23 @@ def add_tts_number_prosody(text: str) -> str:
     def spoken_year(year: str) -> str:
         return "".join(TTS_DIGIT_NAMES[digit] for digit in year)
 
+    def spoken_quantity(value: str, magnitude: str | None = None) -> str:
+        spoken = decimal_to_chinese(value) if "." in value else integer_to_chinese(int(value))
+        return f"{spoken}{magnitude or ''}"
+
     def replace_year_range(match: re.Match[str]) -> str:
         return f"{spoken_year(match.group(1))}年至{spoken_year(match.group(2))}年"
+
+    def replace_measure_range(match: re.Match[str]) -> str:
+        start_value, start_magnitude = match.group(1), match.group(2)
+        end_value, end_magnitude, unit = match.group(3), match.group(4), match.group(5)
+        shared_magnitude = end_magnitude or start_magnitude
+        start_spoken = spoken_quantity(start_value, start_magnitude or shared_magnitude)
+        end_spoken = spoken_quantity(end_value, shared_magnitude)
+        return f"{start_spoken}{unit}到{end_spoken}{unit}"
+
+    def replace_speed(match: re.Match[str]) -> str:
+        return f"每小时{spoken_quantity(match.group(1))}公里"
 
     def replace_date(match: re.Match[str]) -> str:
         year, month, day = match.group(1), int(match.group(2)), int(match.group(3))
@@ -144,29 +165,54 @@ def add_tts_number_prosody(text: str) -> str:
         return f"{spoken_year(year)}年{number_under_100_to_chinese(month)}月"
 
     text = re.sub(r"(?<!\d)(\d{4})年\s*[-—~～至到]\s*(\d{4})年", replace_year_range, text)
+    text = re.sub(
+        r"(?<![\d.])(\d+(?:\.\d+)?)(万|亿)?\s*[-—~～至到]\s*(\d+(?:\.\d+)?)(万|亿)?"
+        r"(美元|人民币|元|岁|亩|公里|分钟|小时)",
+        replace_measure_range,
+        text,
+    )
+    text = re.sub(
+        r"(?<![\d.])(\d+(?:\.\d+)?)(美元|人民币|元|岁|亩|公里|分钟|小时)"
+        r"\s*[-—~～至到]\s*(\d+(?:\.\d+)?)\2",
+        lambda match: (
+            f"{spoken_quantity(match.group(1))}{match.group(2)}"
+            f"到{spoken_quantity(match.group(3))}{match.group(2)}"
+        ),
+        text,
+    )
+    text = re.sub(
+        r"(?<![\d.])(\d+(?:\.\d+)?)(万|亿)(亩|公里|分钟|小时|个|人|家|座|项)",
+        lambda match: f"[emphasis]{spoken_quantity(match.group(1), match.group(2))}{match.group(3)}",
+        text,
+    )
+    text = re.sub(
+        r"(?<![\d.])(\d+(?:\.\d+)?)\s*(?:km/h|KM/H|公里/小时|公里／小时)",
+        replace_speed,
+        text,
+    )
     text = re.sub(r"(?<!\d)(\d{4})年(\d{1,2})月(\d{1,2})日", replace_date, text)
     text = re.sub(r"(?<!\d)(\d{4})年(\d{1,2})月", replace_year_month, text)
     text = re.sub(r"(?<!\d)(\d{4})年", lambda match: f"{spoken_year(match.group(1))}年", text)
     text = re.sub(
         r"(?<![\d.])(\d+(?:\.\d+)?)个百分点",
-        lambda match: f"[emphasis]{decimal_to_chinese(match.group(1))}个百分点[short pause]",
+        lambda match: f"[emphasis]{decimal_to_chinese(match.group(1))}个百分点",
         text,
     )
     text = re.sub(
         r"(?<![\d.])(\d+(?:\.\d+)?)%",
-        lambda match: f"[emphasis]百分之{decimal_to_chinese(match.group(1))}[short pause]",
+        lambda match: f"[emphasis]百分之{decimal_to_chinese(match.group(1))}",
         text,
     )
     text = re.sub(
         r"(?<![\d.])(\d+(?:\.\d+)?)倍",
-        lambda match: f"[emphasis]{decimal_to_chinese(match.group(1))}倍[short pause]",
+        lambda match: f"[emphasis]{decimal_to_chinese(match.group(1))}倍",
         text,
     )
     text = re.sub(
         r"(?<![\d.])(\d+(?:\.\d+)?)(万|亿)?(多)?(美元|人民币|元)(多)?",
         lambda match: (
             f"[emphasis]{decimal_to_chinese(match.group(1))}"
-            f"{match.group(2) or ''}{match.group(3) or ''}{match.group(4)}{match.group(5) or ''}[short pause]"
+            f"{match.group(2) or ''}{match.group(3) or ''}{match.group(4)}{match.group(5) or ''}"
         ),
         text,
     )
@@ -176,8 +222,8 @@ def add_tts_number_prosody(text: str) -> str:
         text,
     )
     text = re.sub(
-        r"(?<![\d.])(\d{1,4})(座|家|人|项|个)",
-        lambda match: f"[emphasis]{integer_to_chinese(int(match.group(1)))}{match.group(2)}",
+        r"(?<![\d.])(\d{1,5})(多)?(座|家|人|项|个|亩|岁|公里|分钟|小时|万标箱)",
+        lambda match: f"[emphasis]{integer_to_chinese(int(match.group(1)))}{match.group(2) or ''}{match.group(3)}",
         text,
     )
     return re.sub(r"(?<![\d./-])\d{4,}(?![\d./-])", lambda match: digits_to_spoken_chinese(match.group(0)), text)
