@@ -22,6 +22,9 @@ TTS_DIGIT_NAMES = {
 TTS_PAUSE_TAG_RE = re.compile(r"(?:\s*\[(?:short pause|pause)]\s*)+$")
 TTS_CLOSE_QUOTE_RE = re.compile(r"([。！？!?；;，,])\s*\n\s*([”’」』）】》])")
 CJK_RANGE = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+NUMBER_VALUE_RE = r"\d+(?:,\d{3})*(?:\.\d+)?"
+CURRENCY_UNITS = "美元|人民币|韩元|日元|欧元|英镑|港元|新元|元"
+DROP_TTS_HEADINGS = {"封面文章"}
 
 
 @dataclass(frozen=True)
@@ -75,6 +78,7 @@ def integer_to_chinese(value: int) -> str:
 
 
 def decimal_to_chinese(value: str) -> str:
+    value = value.replace(",", "")
     integer, dot, fraction = value.partition(".")
     spoken = integer_to_chinese(int(integer))
     if dot:
@@ -97,9 +101,16 @@ def strip_markdown_for_tts(markdown: str) -> str:
     text = re.sub(r"```.*?```", "\n", text, flags=re.DOTALL)
     text = re.sub(r"!\[[^\]]*]\([^)]*\)", "", text)
     text = re.sub(r"\[([^\]]+)]\([^)]*\)", r"\1", text)
+
+    def replace_heading(match: re.Match[str]) -> str:
+        heading = match.group(1).strip()
+        if heading in DROP_TTS_HEADINGS:
+            return "\n"
+        return f"\n[pause]\n{heading}\n[short pause]\n"
+
     text = re.sub(
         r"^\s{0,3}#{1,6}\s*(.+?)\s*#*\s*$",
-        lambda match: f"\n[pause]\n{match.group(1).strip()}\n[short pause]\n",
+        replace_heading,
         text,
         flags=re.MULTILINE,
     )
@@ -136,9 +147,10 @@ def sanitize_tts_input_text(text: str) -> str:
 
 def add_tts_number_prosody(text: str) -> str:
     def spoken_year(year: str) -> str:
-        return "".join(TTS_DIGIT_NAMES[digit] for digit in year)
+        return "".join("〇" if digit == "0" else TTS_DIGIT_NAMES[digit] for digit in year)
 
     def spoken_quantity(value: str, magnitude: str | None = None) -> str:
+        value = value.replace(",", "")
         spoken = decimal_to_chinese(value) if "." in value else integer_to_chinese(int(value))
         return f"{spoken}{magnitude or ''}"
 
@@ -153,6 +165,20 @@ def add_tts_number_prosody(text: str) -> str:
         end_spoken = spoken_quantity(end_value, shared_magnitude)
         return f"{start_spoken}{unit}到{end_spoken}{unit}"
 
+    def replace_percent_range(match: re.Match[str]) -> str:
+        return f"[emphasis]百分之{decimal_to_chinese(match.group(1))}到百分之{decimal_to_chinese(match.group(2))}"
+
+    def replace_temperature_range(match: re.Match[str]) -> str:
+        unit = "摄氏度" if match.group(3) == "℃" else "度"
+        return f"{spoken_quantity(match.group(1))}到{spoken_quantity(match.group(2))}{unit}"
+
+    def replace_temperature(match: re.Match[str]) -> str:
+        unit = "摄氏度" if match.group(2) == "℃" else "度"
+        return f"[emphasis]{spoken_quantity(match.group(1))}{unit}"
+
+    def replace_price_per_unit(match: re.Match[str]) -> str:
+        return f"[emphasis]每{match.group(2)}{spoken_quantity(match.group(1))}元"
+
     def replace_speed(match: re.Match[str]) -> str:
         return f"每小时{spoken_quantity(match.group(1))}公里"
 
@@ -164,16 +190,38 @@ def add_tts_number_prosody(text: str) -> str:
         year, month = match.group(1), int(match.group(2))
         return f"{spoken_year(year)}年{number_under_100_to_chinese(month)}月"
 
-    text = re.sub(r"(?<!\d)(\d{4})年\s*[-—~～至到]\s*(\d{4})年", replace_year_range, text)
+    def replace_month_day(match: re.Match[str]) -> str:
+        month, day = int(match.group(1)), int(match.group(2))
+        return f"{number_under_100_to_chinese(month)}月{number_under_100_to_chinese(day)}日"
+
+    def replace_month(match: re.Match[str]) -> str:
+        return f"{number_under_100_to_chinese(int(match.group(1)))}月"
+
+    def replace_clock_time(match: re.Match[str]) -> str:
+        suffix = match.group(2) or ""
+        return f"{number_under_100_to_chinese(int(match.group(1)))}点{suffix}"
+
+    text = re.sub(r"(?<!\d)(\d{4})\s*年\s*[-—~～至到]\s*(\d{4})\s*年", replace_year_range, text)
+    text = re.sub(r"(?<!\d)(\d{4})\s*[-—~～至到]\s*(\d{4})\s*年", replace_year_range, text)
     text = re.sub(
-        r"(?<![\d.])(\d+(?:\.\d+)?)(万|亿)?\s*[-—~～至到]\s*(\d+(?:\.\d+)?)(万|亿)?"
-        r"(美元|人民币|元|岁|亩|公里|分钟|小时)",
+        rf"(?<![\d.])({NUMBER_VALUE_RE})\s*%\s*[-—~～至到]\s*({NUMBER_VALUE_RE})\s*%",
+        replace_percent_range,
+        text,
+    )
+    text = re.sub(
+        rf"(?<![\d.])({NUMBER_VALUE_RE})\s*[-—~～至到]\s*({NUMBER_VALUE_RE})\s*(℃|度)",
+        replace_temperature_range,
+        text,
+    )
+    text = re.sub(
+        rf"(?<![\d.])({NUMBER_VALUE_RE})\s*(万|亿)?\s*[-—~～至到]\s*({NUMBER_VALUE_RE})\s*(万|亿)?\s*"
+        rf"({CURRENCY_UNITS}|岁|亩|公里|分钟|小时|年)",
         replace_measure_range,
         text,
     )
     text = re.sub(
-        r"(?<![\d.])(\d+(?:\.\d+)?)(美元|人民币|元|岁|亩|公里|分钟|小时)"
-        r"\s*[-—~～至到]\s*(\d+(?:\.\d+)?)\2",
+        rf"(?<![\d.])({NUMBER_VALUE_RE})\s*({CURRENCY_UNITS}|岁|亩|公里|分钟|小时|年)"
+        rf"\s*[-—~～至到]\s*({NUMBER_VALUE_RE})\s*\2",
         lambda match: (
             f"{spoken_quantity(match.group(1))}{match.group(2)}"
             f"到{spoken_quantity(match.group(3))}{match.group(2)}"
@@ -181,35 +229,49 @@ def add_tts_number_prosody(text: str) -> str:
         text,
     )
     text = re.sub(
-        r"(?<![\d.])(\d+(?:\.\d+)?)(万|亿)(亩|公里|分钟|小时|个|人|家|座|项)",
+        rf"(?<![\d.])({NUMBER_VALUE_RE})\s*(万|亿)\s*(亩|公里|分钟|小时|吨|斤|公斤|千克|个|人|名|位|家|座|项|台|起|例|件|次|{CURRENCY_UNITS})",
         lambda match: f"[emphasis]{spoken_quantity(match.group(1), match.group(2))}{match.group(3)}",
         text,
     )
     text = re.sub(
-        r"(?<![\d.])(\d+(?:\.\d+)?)\s*(?:km/h|KM/H|公里/小时|公里／小时)",
+        rf"(?<![\d.])({NUMBER_VALUE_RE})\s*(?:km/h|KM/H|公里/小时|公里／小时)",
         replace_speed,
         text,
     )
-    text = re.sub(r"(?<!\d)(\d{4})年(\d{1,2})月(\d{1,2})日", replace_date, text)
-    text = re.sub(r"(?<!\d)(\d{4})年(\d{1,2})月", replace_year_month, text)
-    text = re.sub(r"(?<!\d)(\d{4})年", lambda match: f"{spoken_year(match.group(1))}年", text)
     text = re.sub(
-        r"(?<![\d.])(\d+(?:\.\d+)?)个百分点",
+        rf"(?<![\d.])({NUMBER_VALUE_RE})\s*元\s*[/／]\s*(斤|公斤|千克|吨)",
+        replace_price_per_unit,
+        text,
+    )
+    text = re.sub(r"(?<!\d)(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", replace_date, text)
+    text = re.sub(r"(?<!\d)(\d{4})\s*年\s*(\d{1,2})\s*月", replace_year_month, text)
+    text = re.sub(r"(?<!\d)(\d{4})\s*年", lambda match: f"{spoken_year(match.group(1))}年", text)
+    text = re.sub(r"(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*日", replace_month_day, text)
+    text = re.sub(r"(?<!\d)(\d{1,2})\s*月", replace_month, text)
+    text = re.sub(r"(?<!\d)(\d{1,2})\s*世纪", lambda match: f"{number_under_100_to_chinese(int(match.group(1)))}世纪", text)
+    text = re.sub(r"(?<!\d)(\d{1,2})\s*点\s*(多|半|钟|班)?", replace_clock_time, text)
+    text = re.sub(
+        rf"(?<![\d.])({NUMBER_VALUE_RE})\s*(℃|度)",
+        replace_temperature,
+        text,
+    )
+    text = re.sub(
+        rf"(?<![\d.])({NUMBER_VALUE_RE})\s*个百分点",
         lambda match: f"[emphasis]{decimal_to_chinese(match.group(1))}个百分点",
         text,
     )
     text = re.sub(
-        r"(?<![\d.])(\d+(?:\.\d+)?)%",
+        rf"(?<![\d.])({NUMBER_VALUE_RE})\s*%",
         lambda match: f"[emphasis]百分之{decimal_to_chinese(match.group(1))}",
         text,
     )
     text = re.sub(
-        r"(?<![\d.])(\d+(?:\.\d+)?)倍",
+        rf"(?<![\d.])({NUMBER_VALUE_RE})\s*倍",
         lambda match: f"[emphasis]{decimal_to_chinese(match.group(1))}倍",
         text,
     )
     text = re.sub(
-        r"(?<![\d.])(\d+(?:\.\d+)?)(万|亿)?(多)?(美元|人民币|元)(多)?",
+        rf"(?<![\d.])({NUMBER_VALUE_RE})\s*(万|亿)?\s*(多)?\s*({CURRENCY_UNITS})(多)?",
         lambda match: (
             f"[emphasis]{decimal_to_chinese(match.group(1))}"
             f"{match.group(2) or ''}{match.group(3) or ''}{match.group(4)}{match.group(5) or ''}"
@@ -222,11 +284,30 @@ def add_tts_number_prosody(text: str) -> str:
         text,
     )
     text = re.sub(
-        r"(?<![\d.])(\d{1,5})(多)?(座|家|人|项|个|亩|岁|公里|分钟|小时|万标箱)",
-        lambda match: f"[emphasis]{integer_to_chinese(int(match.group(1)))}{match.group(2) or ''}{match.group(3)}",
+        rf"(?<![\d.])({NUMBER_VALUE_RE})\s*(多|余)?\s*(座|家|人|名|位|项|个|亩|岁|年|公里|分钟|小时|斤|吨|辆|支|场|户|台|起|例|件|次|万标箱)",
+        lambda match: f"[emphasis]{spoken_quantity(match.group(1))}{match.group(2) or ''}{match.group(3)}",
         text,
     )
     return re.sub(r"(?<![\d./-])\d{4,}(?![\d./-])", lambda match: digits_to_spoken_chinese(match.group(0)), text)
+
+
+def cleanup_tts_spacing(text: str) -> str:
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(fr"([{CJK_RANGE}])\s+([{CJK_RANGE}])", r"\1\2", text)
+    text = re.sub(fr"(\])\s+([{CJK_RANGE}])", r"\1\2", text)
+    text = re.sub(fr"([{CJK_RANGE}])\s+([，。！？；：、）】》”’」』])", r"\1\2", text)
+    return text
+
+
+def collapse_redundant_pause_tags(text: str) -> str:
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r"\[short pause]\s+(?:\[short pause]\s+)+", "[short pause]\n\n", text)
+        text = re.sub(r"\[pause]\s+(?:\[short pause]\s+)+", "[pause]\n\n", text)
+    return text
 
 
 def add_pause_tags(text: str) -> str:
@@ -243,7 +324,9 @@ def normalize_markdown_for_tts(markdown: str) -> str:
     text = strip_markdown_for_tts(markdown)
     text = sanitize_tts_input_text(text)
     text = add_pause_tags(text)
-    return add_tts_number_prosody(text).strip()
+    text = add_tts_number_prosody(text)
+    text = cleanup_tts_spacing(text)
+    return collapse_redundant_pause_tags(text).strip()
 
 
 def normalize_tts_chunk(chunk: str) -> str:
@@ -305,10 +388,18 @@ def preflight_tts_chunks(chunks: list[str]) -> list[TTSPreflightIssue]:
     for index, chunk in enumerate(chunks, start=1):
         if TTS_PAUSE_TAG_RE.search(chunk):
             issues.append(TTSPreflightIssue("trailing_pause_tag", "chunk ends with pause control tag", index))
-        if re.search(r"\d{4}年\s*[-—~～]\s*\d{4}年", chunk):
+        if re.search(r"\d{4}\s*年?\s*[-—~～]\s*\d{4}\s*年", chunk):
             issues.append(TTSPreflightIssue("raw_year_range", "year range still contains a dash", index))
-        if re.search(r"\d+(?:\.\d+)?(?:多)?(?:美元|人民币|元)", chunk):
+        if re.search(rf"{NUMBER_VALUE_RE}(?:\s*(?:万|亿))?(?:多)?(?:{CURRENCY_UNITS})", chunk):
             issues.append(TTSPreflightIssue("raw_money", "money amount was not spoken-normalized", index))
+        if re.search(r"(^|\n)\s*(?:\[pause]\s*)?(?:封面文章)(?:\s*\[short pause])?(?=\s|$)", chunk):
+            issues.append(TTSPreflightIssue("section_heading", "section heading should not be read as body text", index))
+        if re.search(
+            r"\d+(?:\.\d+)?\s*(?:%|℃|公里/小时|公里／小时|元\s*[/／]\s*(?:斤|公斤|千克|吨)|"
+            r"月|日|斤|吨|点|世纪|名|位|年|度|台|起|例|件|次)",
+            chunk,
+        ):
+            issues.append(TTSPreflightIssue("raw_number_unit", "number-unit expression was not spoken-normalized", index))
         if re.search(rf"([{CJK_RANGE}])\s+([{CJK_RANGE}])", chunk):
             issues.append(TTSPreflightIssue("cjk_space", "space remains between CJK characters", index))
         if re.search(r"([。！？!?；;])\n+([”’」』）】》])", chunk):
